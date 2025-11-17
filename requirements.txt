@@ -1,0 +1,43 @@
+# Core dependencies
+pymilvus>=2.3.0
+numpy>=1.24.0
+scipy>=1.10.0
+pyyaml>=6.0.0
+
+# Async support
+asyncio
+
+# API service
+fastapi>=0.110.0
+uvicorn>=0.29.0
+pydantic>=2.4.0
+prometheus-client>=0.20.0
+opentelemetry-sdk>=1.26.0
+opentelemetry-exporter-otlp>=1.26.0
+opentelemetry-instrumentation-fastapi>=0.47b0
+opentelemetry-instrumentation-requests>=0.47b0
+psycopg2-binary>=2.9.9
+SQLAlchemy>=2.0.0
+alembic>=1.13.1
+
+# Optional: Embedding models
+# openai>=1.0.0  # For OpenAI embeddings
+# cohere>=4.0.0  # For Cohere embeddings
+# sentence-transformers>=2.2.0  # For local embeddings
+
+# Optional: Reranking
+# transformers>=4.30.0  # For cross-encoder reranking
+# torch>=2.0.0  # Required for transformers
+
+# Optional: Advanced NLP
+# spacy>=3.5.0  # For advanced text processing
+# nltk>=3.8.0  # For text analysis
+
+# Development dependencies
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+flake8>=6.0.0
+
+# Documentation
+# sphinx>=6.0.0  # For generating docs

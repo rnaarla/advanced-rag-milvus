@@ -1,0 +1,172 @@
+# Advanced RAG Pipeline Configuration Template
+# Copy this file to config.yaml and customize for your deployment
+
+# Milvus Configuration
+milvus:
+  host: "localhost"
+  port: 19530
+  user: ""  # Optional
+  password: ""  # Optional
+  
+  # Collection settings
+  enable_sharding: true
+  num_shards: 4
+  
+  # Index configurations
+  semantic_index:
+    dimension: 1536  # OpenAI ada-002
+    index_type: "HNSW"
+    metric_type: "COSINE"
+    index_params:
+      M: 16
+      efConstruction: 200
+  
+  sparse_index:
+    dimension: 10000
+    index_type: "SPARSE_INVERTED_INDEX"
+    metric_type: "IP"
+    index_params:
+      drop_ratio_build: 0.2
+  
+  domain_index:
+    dimension: 768  # Domain-specific model
+    index_type: "HNSW"
+    metric_type: "COSINE"
+    index_params:
+      M: 12
+      efConstruction: 150
+
+# Pipeline Configuration
+pipeline:
+  # Performance targets
+  target_latency_ms: 80.0
+  enable_hierarchical_index: true
+  
+  # Retrieval settings
+  hybrid_alpha: 0.7  # 0=sparse only, 1=dense only
+  top_k: 20
+  rerank_top_k: 5
+  enable_reranking: true
+  
+  # Quality thresholds
+  min_relevance_score: 0.65
+  max_hallucination_risk: 0.15
+  
+  # Compliance
+  enable_audit_logging: true
+  enable_versioning: true
+  retention_days: 90
+
+# Chunking Configuration
+chunking:
+  base_chunk_size: 512
+  max_chunk_size: 1024
+  min_chunk_size: 128
+  overlap_ratio: 0.15
+  semantic_boundary_detection: true
+
+# Embedding Configuration
+embeddings:
+  provider: "openai"  # openai, cohere, huggingface, local
+  
+  # OpenAI settings
+  openai:
+    api_key: "${OPENAI_API_KEY}"
+    model: "text-embedding-3-large"
+    batch_size: 100
+  
+  # Cohere settings
+  cohere:
+    api_key: "${COHERE_API_KEY}"
+    model: "embed-english-v3.0"
+  
+  # HuggingFace settings
+  huggingface:
+    model: "sentence-transformers/all-mpnet-base-v2"
+    device: "cuda"  # cuda, cpu
+  
+  # Sparse embeddings (BM25)
+  sparse:
+    method: "bm25"  # bm25, splade
+    vocabulary_size: 10000
+
+# Reranking Configuration
+reranking:
+  enabled: true
+  model: "cross-encoder/ms-marco-MiniLM-L-12-v2"
+  batch_size: 32
+  device: "cuda"  # cuda, cpu
+
+# Evaluation Configuration
+evaluation:
+  drift_threshold: 0.15
+  hallucination_threshold: 0.20
+  enable_nli_faithfulness: false  # Requires NLI model
+  nli_model: "microsoft/deberta-large-mnli"
+
+# Domain Lexicons
+domains:
+  technical:
+    - "algorithm"
+    - "architecture"
+    - "database"
+    - "optimization"
+    - "protocol"
+  
+  medical:
+    - "diagnosis"
+    - "treatment"
+    - "symptom"
+    - "clinical"
+    - "therapy"
+  
+  financial:
+    - "investment"
+    - "portfolio"
+    - "equity"
+    - "derivative"
+    - "valuation"
+
+# Monitoring & Logging
+monitoring:
+  enable_telemetry: true
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  metrics_port: 9090
+  
+  # Performance monitoring
+  track_latency: true
+  track_throughput: true
+  track_error_rate: true
+  
+  # Quality monitoring
+  track_hallucination_risk: true
+  track_faithfulness: true
+  track_drift: true
+
+# Storage Configuration
+storage:
+  # For audit logs and versioning
+  backend: "local"  # local, s3, gcs, azure
+  
+  local:
+    path: "./data/compliance"
+  
+  s3:
+    bucket: "rag-compliance-logs"
+    region: "us-east-1"
+    access_key: "${AWS_ACCESS_KEY}"
+    secret_key: "${AWS_SECRET_KEY}"
+
+# Security Configuration
+security:
+  enable_authentication: false
+  enable_encryption: false
+  
+  # Document classification
+  classification_levels:
+    - "public"
+    - "internal"
+    - "confidential"
+    - "restricted"
+  
+  default_classification: "internal"

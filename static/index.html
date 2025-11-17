@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Advanced RAG Chat</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 0; background: #0b0f17; color: #e8eaf0; }
+    header { padding: 12px 16px; background: #0f1624; border-bottom: 1px solid #1c2435; display: flex; justify-content: space-between; align-items: center; }
+    header h1 { font-size: 16px; margin: 0; }
+    #controls { display: flex; gap: 8px; }
+    button { background: #1f2a44; color: #e8eaf0; border: 1px solid #2a3550; padding: 8px 10px; border-radius: 6px; cursor: pointer; }
+    button:hover { background: #263156; }
+    #container { display: grid; grid-template-columns: 280px 1fr; height: calc(100vh - 56px); }
+    #sidebar { border-right: 1px solid #1c2435; padding: 12px; overflow-y: auto; }
+    #chat { display: grid; grid-template-rows: 1fr auto; }
+    #messages { padding: 16px; overflow-y: auto; }
+    .msg { margin: 8px 0; padding: 10px 12px; border-radius: 8px; max-width: 800px; white-space: pre-wrap; }
+    .user { background: #13203c; }
+    .assistant { background: #17243f; }
+    .system { color: #aab2c5; }
+    #composer { padding: 12px; border-top: 1px solid #1c2435; }
+    #input { width: calc(100% - 110px); padding: 10px; border-radius: 6px; border: 1px solid #2a3550; background: #0f1624; color: #e8eaf0; }
+    #send { margin-left: 8px; }
+    .suggestions { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; margin-top: 8px; max-width: 820px;}
+    .suggestion { background: #101a2e; border: 1px solid #263155; padding: 8px; border-radius: 8px; cursor: pointer; font-size: 14px; }
+    .suggestion:hover { background: #0e172b; }
+    .citation { font-size: 12px; color: #aab2c5; margin-top: 4px; }
+    .chat-link { cursor: pointer; padding: 6px 8px; border-radius: 6px; display: block; color: #e8eaf0; text-decoration: none; }
+    .chat-link:hover { background: #15203a; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Advanced RAG Chat</h1>
+    <div id="controls">
+      <button id="newChat">New Chat</button>
+      <button id="clearChat">Clear Chat</button>
+    </div>
+  </header>
+  <div id="container">
+    <aside id="sidebar">
+      <div class="system">Sessions</div>
+      <div id="sessions"></div>
+    </aside>
+    <main id="chat">
+      <div id="messages"></div>
+      <div id="composer">
+        <input id="input" placeholder="Ask a question..." />
+        <button id="send">Send</button>
+        <div class="suggestions" id="suggestions"></div>
+      </div>
+    </main>
+  </div>
+  <script src="/ui/app.js"></script>
+</body>
+</html>
+
+
