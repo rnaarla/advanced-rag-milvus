@@ -3,12 +3,16 @@ Hybrid Retrieval Engine
 Combines dense vector search, sparse BM25, and cross-encoder reranking
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
 import numpy as np
 from collections import defaultdict
 import asyncio
 from typing import Callable, Tuple
+import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -342,9 +346,17 @@ class HybridRetriever:
         
         return results[:top_k]
     
+    # Whitelist of allowed filter fields for security
+    ALLOWED_FILTER_FIELDS: Set[str] = {
+        'doc_id', 'chunk_id', 'domain_density', 'timestamp', 
+        'entropy', 'redundancy', 'chunk_index', 'token_count'
+    }
+    
+    ALLOWED_OPERATORS: Set[str] = {'$gte', '$lte', '$gt', '$lt', '$eq', '$ne'}
+    
     def _build_filter_expression(self, filters: Dict[str, Any]) -> str:
         """
-        Build Milvus filter expression from filter dict
+        Build Milvus filter expression from filter dict with security validation
         
         Example filters:
         {
@@ -356,29 +368,50 @@ class HybridRetriever:
         expressions = []
         
         for field, value in filters.items():
+            # SECURITY: Whitelist validation
+            if field not in self.ALLOWED_FILTER_FIELDS:
+                logger.warning(f"Invalid filter field attempted: {field}")
+                raise ValueError(f"Invalid filter field: {field}")
+            
+            # SECURITY: Field name format validation (prevent injection via field names)
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', field):
+                logger.warning(f"Invalid field name format: {field}")
+                raise ValueError(f"Invalid field name format: {field}")
+            
             if isinstance(value, dict):
                 # Handle comparison operators
                 for op, val in value.items():
-                    if op == "$gte":
-                        expressions.append(f'{field} >= {val}')
-                    elif op == "$lte":
-                        expressions.append(f'{field} <= {val}')
-                    elif op == "$gt":
-                        expressions.append(f'{field} > {val}')
-                    elif op == "$lt":
-                        expressions.append(f'{field} < {val}')
-                    elif op == "$eq":
-                        expressions.append(f'{field} == {val}')
-                    elif op == "$ne":
-                        expressions.append(f'{field} != {val}')
+                    # SECURITY: Validate operator
+                    if op not in self.ALLOWED_OPERATORS:
+                        logger.warning(f"Invalid operator attempted: {op}")
+                        raise ValueError(f"Invalid operator: {op}")
+                    
+                    # SECURITY: Type validation
+                    if not isinstance(val, (int, float, str, bool)):
+                        raise ValueError(f"Invalid value type for {field}: {type(val)}")
+                    
+                    op_map = {
+                        '$gte': '>=', '$lte': '<=', 
+                        '$gt': '>', '$lt': '<',
+                        '$eq': '==', '$ne': '!='
+                    }
+                    
+                    if isinstance(val, str):
+                        # Escape special characters properly
+                        safe_val = val.replace("\\", "\\\\").replace('"', '\\"')
+                        expressions.append(f'{field} {op_map[op]} "{safe_val}"')
+                    else:
+                        expressions.append(f'{field} {op_map[op]} {val}')
             else:
                 # Direct equality
                 if isinstance(value, str):
-                    # Escape double quotes and backslashes in strings
+                    # Escape special characters
                     safe_val = value.replace("\\", "\\\\").replace('"', '\\"')
                     expressions.append(f'{field} == "{safe_val}"')
-                else:
+                elif isinstance(value, (int, float, bool)):
                     expressions.append(f'{field} == {value}')
+                else:
+                    raise ValueError(f"Unsupported value type for {field}: {type(value)}")
         
         return " and ".join(expressions) if expressions else None
     

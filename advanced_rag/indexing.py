@@ -43,6 +43,10 @@ import asyncio
 from datetime import datetime
 import logging
 from scipy.sparse import csr_matrix, issparse
+from concurrent.futures import ThreadPoolExecutor
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from .embedding_cache import get_semantic_cache
 
 
 class IndexType(Enum):
@@ -113,6 +117,12 @@ class MilvusIndexManager:
         
         # Embedding generators (placeholders - integrate with actual models)
         self.embedding_generator = None  # Will be set externally
+        
+        # Thread pool for CPU-intensive embedding operations
+        self.embedding_executor = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="embedding-"
+        )
         
         # Connect to Milvus
         if connect:
@@ -295,10 +305,15 @@ class MilvusIndexManager:
                 "timestamp": [],
             }
         
-        for chunk in chunks:
+        # Batch generate semantic embeddings for all chunks
+        chunk_texts = [chunk.text for chunk in chunks]
+        semantic_embeddings = await self._generate_semantic_embeddings_batch(chunk_texts)
+        
+        for i, chunk in enumerate(chunks):
             try:
-                # Generate embeddings
-                semantic_emb = await self._generate_semantic_embedding(chunk.text)
+                # Use pre-generated semantic embedding
+                semantic_emb = semantic_embeddings[i]
+                
                 # Sparse and domain are best‑effort; failures should not break ingest.
                 sparse_emb = None
                 try:
@@ -420,6 +435,12 @@ class MilvusIndexManager:
         
         return summary
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(Exception),
+        reraise=True
+    )
     async def search(  # pragma: no cover
         self,
         query_embedding: np.ndarray,
@@ -429,7 +450,7 @@ class MilvusIndexManager:
         search_params: Optional[Dict] = None
     ) -> List[Dict[str, Any]]:
         """
-        Search in a specific collection
+        Search in a specific collection with timeout and retry
         
         Args:
             query_embedding: Query vector
@@ -461,7 +482,6 @@ class MilvusIndexManager:
                     "params": {"ef": 64}
                 }
         
-        # Perform search (offload blocking call)
         # Prepare query vector format
         if is_sparse:
             # Accept dict payload or scipy sparse; normalize to CSR matrix (1, dim)
@@ -478,27 +498,36 @@ class MilvusIndexManager:
         else:
             query_data = [query_embedding.tolist()]
         
-        # Use keyword arguments to be robust across pymilvus versions and avoid
-        # positional misalignment (which can cause partition-name errors).
-        results = await asyncio.to_thread(
-            collection.search,
-            query_data,
-            "embedding",
-            search_params,
-            top_k,
-            expr=filters,
-            output_fields=[
-                "chunk_id",
-                "doc_id",
-                "content",
-                "chunk_index",
-                "entropy",
-                "redundancy",
-                "domain_density",
-                "metadata_json",
-                "timestamp",
-            ],
-        )
+        # Perform search with timeout
+        try:
+            results = await asyncio.wait_for(
+                asyncio.to_thread(
+                    collection.search,
+                    query_data,
+                    "embedding",
+                    search_params,
+                    top_k,
+                    expr=filters,
+                    output_fields=[
+                        "chunk_id",
+                        "doc_id",
+                        "content",
+                        "chunk_index",
+                        "entropy",
+                        "redundancy",
+                        "domain_density",
+                        "metadata_json",
+                        "timestamp",
+                    ],
+                ),
+                timeout=5.0  # 5 second timeout
+            )
+        except asyncio.TimeoutError:
+            logging.error(f"Milvus search timeout for collection {collection_name}")
+            raise Exception(f"Search timeout for collection {collection_name}")
+        except Exception as e:
+            logging.error(f"Milvus search failed for {collection_name}: {e}")
+            raise
         
         # Format results
         formatted_results = []
@@ -520,24 +549,91 @@ class MilvusIndexManager:
         
         return formatted_results
     
+    async def _generate_semantic_embeddings_batch(self, texts: List[str]) -> List[np.ndarray]:
+        """
+        Generate semantic embeddings in batch for improved throughput
+        
+        Args:
+            texts: List of text strings to embed
+            
+        Returns:
+            List of embedding vectors
+        """
+        cache = get_semantic_cache()
+        embeddings = []
+        
+        # Check which texts are already in cache
+        cache_misses = []
+        cache_miss_indices = []
+        
+        for i, text in enumerate(texts):
+            cached = await cache.get(text)
+            if cached is not None:
+                embeddings.append(cached)
+            else:
+                embeddings.append(None)  # Placeholder
+                cache_misses.append(text)
+                cache_miss_indices.append(i)
+        
+        # Generate embeddings for cache misses in batch
+        if cache_misses and self.embedding_generator:
+            loop = asyncio.get_event_loop()
+            
+            # Batch encode in thread pool
+            batch_embeddings = await loop.run_in_executor(
+                self.embedding_executor,
+                lambda: [self.embedding_generator.encode_semantic(text) for text in cache_misses]
+            )
+            
+            # Store in cache and update results
+            for i, emb in zip(cache_miss_indices, batch_embeddings):
+                await cache.put(cache_misses[cache_miss_indices.index(i)], emb)
+                embeddings[i] = emb
+        elif cache_misses:
+            # Fallback: random embeddings
+            for i in cache_miss_indices:
+                emb = np.random.randn(self.semantic_dim).astype(np.float32)
+                embeddings[i] = emb
+        
+        return embeddings
+    
     async def _generate_semantic_embedding(self, text: str) -> np.ndarray:
         """
-        Generate dense semantic embedding
+        Generate dense semantic embedding with async execution and caching
         In production, integrate with actual embedding model (OpenAI, Cohere, etc.)
         """
-        if self.embedding_generator:
-            return await self.embedding_generator.encode_semantic(text)
+        # Check cache first
+        cache = get_semantic_cache()
         
-        # Placeholder: random embedding for demonstration
-        return np.random.randn(self.semantic_dim).astype(np.float32)
+        async def compute_embedding():
+            if self.embedding_generator:
+                # Offload CPU-intensive work to thread pool
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(
+                    self.embedding_executor,
+                    self.embedding_generator.encode_semantic,
+                    text
+                )
+            
+            # Placeholder: random embedding for demonstration
+            return np.random.randn(self.semantic_dim).astype(np.float32)
+        
+        # Get from cache or compute
+        embedding = await cache.get_or_compute(text, compute_embedding)
+        return embedding
     
     async def _generate_sparse_embedding(self, text: str):
         """
-        Generate sparse embedding (BM25-style)
+        Generate sparse embedding (BM25-style) with async execution
         In production, use BM25 or SPLADE
         """
         if self.embedding_generator:
-            return await self.embedding_generator.encode_sparse(text)
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.embedding_executor,
+                self.embedding_generator.encode_sparse,
+                text
+            )
         
         # Placeholder: construct a valid SPARSE_FLOAT_VECTOR payload
         # Milvus expects a dict with 'indices' and 'values'
@@ -556,11 +652,15 @@ class MilvusIndexManager:
         domain: Optional[str] = None
     ) -> np.ndarray:
         """
-        Generate domain-specific embedding
+        Generate domain-specific embedding with async execution
         In production, use domain-adapted models
         """
         if self.embedding_generator:
-            return await self.embedding_generator.encode_domain(text, domain)
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                self.embedding_executor,
+                lambda: self.embedding_generator.encode_domain(text, domain)
+            )
         
         # Placeholder: random embedding
         return np.random.randn(self.domain_dim).astype(np.float32)
@@ -595,4 +695,9 @@ class MilvusIndexManager:
             connections.disconnect("default")
         except Exception:
             pass
+        
+        # Shutdown thread pool executor
+        if hasattr(self, 'embedding_executor'):
+            self.embedding_executor.shutdown(wait=True)
+        
         print("Disconnected from Milvus")

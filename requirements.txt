@@ -19,6 +19,8 @@ opentelemetry-instrumentation-requests>=0.47b0
 psycopg2-binary>=2.9.9
 SQLAlchemy>=2.0.0
 alembic>=1.13.1
+slowapi>=0.1.9
+tenacity>=8.2.0
 
 # Optional: Embedding models
 # openai>=1.0.0  # For OpenAI embeddings

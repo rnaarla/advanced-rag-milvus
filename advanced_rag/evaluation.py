@@ -6,7 +6,7 @@ Quantifies hallucination risk, faithfulness, and retrieval drift
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 import asyncio
 
@@ -81,10 +81,10 @@ class RAGEvaluator:
         self.drift_threshold = drift_threshold
         self.hallucination_threshold = hallucination_threshold
         
-        # Historical data for drift detection
-        self.query_embeddings_history: List[np.ndarray] = []
-        self.score_distributions_history: List[np.ndarray] = []
-        self.timestamp_history: List[datetime] = []
+        # Historical data for drift detection - use deque with maxlen to prevent memory leak
+        self.query_embeddings_history = deque(maxlen=1000)
+        self.score_distributions_history = deque(maxlen=1000)
+        self.timestamp_history = deque(maxlen=1000)
         
         # NLI model for faithfulness (placeholder)
         self.nli_model = None

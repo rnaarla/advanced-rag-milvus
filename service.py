@@ -13,18 +13,25 @@ Endpoints:
 
 import os
 import asyncio
-import sqlite3
-import psycopg2
 import json
 import time
+import uuid
+import signal
 from typing import Any, Dict, List, Optional, Generator
+from contextvars import ContextVar
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, PlainTextResponse, FileResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from pydantic import BaseModel, Field, validator
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from advanced_rag import AdvancedRAGPipeline, PipelineConfig
+from advanced_rag.db_pool import initialize_pool, get_pool, close_pool
+from advanced_rag.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerOpenError
+from advanced_rag.exceptions import ValidationError
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
@@ -36,17 +43,29 @@ from opentelemetry.instrumentation.requests import RequestsInstrumentor
 
 class IngestDocument(BaseModel):
     id: Optional[str] = None
-    text: str
+    text: str = Field(..., min_length=1, max_length=1_000_000)
     metadata: Optional[Dict[str, Any]] = None
+    
+    @validator('text')
+    def validate_text(cls, v):
+        if not v.strip():
+            raise ValueError("Text cannot be empty or whitespace only")
+        return v
+    
+    @validator('metadata')
+    def validate_metadata(cls, v):
+        if v is not None and len(json.dumps(v)) > 10000:
+            raise ValueError("Metadata too large (max 10KB)")
+        return v
 
 
 class IngestRequest(BaseModel):
-    documents: List[IngestDocument]
-    domain: Optional[str] = None
+    documents: List[IngestDocument] = Field(..., min_items=1, max_items=1000)
+    domain: Optional[str] = Field(None, max_length=100)
 
 
 class RetrieveRequest(BaseModel):
-    query: str
+    query: str = Field(..., min_length=1, max_length=10000)
     filters: Optional[Dict[str, Any]] = None
     context: Optional[Dict[str, Any]] = None
     use_domain_index: Optional[bool] = False
@@ -55,6 +74,35 @@ class RetrieveRequest(BaseModel):
 
 app = FastAPI(title="Advanced RAG Service")
 app.mount("/ui", StaticFiles(directory="static", html=True), name="ui")
+
+# Initialize rate limiter
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Request ID context for tracing
+request_id_var: ContextVar[str] = ContextVar('request_id', default='')
+
+# Shutdown event
+shutdown_event = asyncio.Event()
+
+def handle_sigterm(signum, frame):
+    """Handle SIGTERM for graceful shutdown"""
+    print("Received SIGTERM, initiating graceful shutdown...")
+    shutdown_event.set()
+
+signal.signal(signal.SIGTERM, handle_sigterm)
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """Add request ID for distributed tracing"""
+    request_id = request.headers.get('X-Request-ID', str(uuid.uuid4()))
+    request_id_var.set(request_id)
+    
+    response = await call_next(request)
+    response.headers['X-Request-ID'] = request_id
+    return response
 
 
 def _get_pipeline() -> AdvancedRAGPipeline:
@@ -75,18 +123,30 @@ pipeline_instance: Optional[AdvancedRAGPipeline] = None
 milvus_ready: bool = False
 db_path = os.getenv("CHAT_DB_PATH", "./chat.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# Prometheus metrics
 REQUEST_COUNTER = Counter("rag_api_requests_total", "API requests", ["endpoint", "method"])
 RETRIEVE_LATENCY = Histogram("rag_retrieve_latency_ms", "Retrieve latency (ms)")
+ERRORS_COUNTER = Counter("rag_errors_total", "Total errors", ["endpoint", "error_type"])
+ACTIVE_REQUESTS = Gauge("rag_active_requests", "Active requests", ["endpoint"])
+EMBEDDING_LATENCY = Histogram("rag_embedding_latency_seconds", "Embedding generation latency", ["embedding_type"])
+
 API_KEY = os.getenv("API_KEY", "")
-# Concurrency, timeout, and circuit breaker settings
+
+# Concurrency and timeout settings
 MAX_CONCURRENCY = int(os.getenv("RAG_MAX_CONCURRENCY", "64"))
 RETRIEVE_TIMEOUT_MS = int(os.getenv("RAG_RETRIEVE_TIMEOUT_MS", "300"))
-CB_FAILS = int(os.getenv("RAG_CB_FAILS", "10"))
-CB_WINDOW_SEC = int(os.getenv("RAG_CB_WINDOW_SEC", "30"))
-CB_OPEN_SEC = int(os.getenv("RAG_CB_OPEN_SEC", "15"))
+
+# Circuit breaker for retrieval operations
+circuit_breaker = CircuitBreaker(
+    CircuitBreakerConfig(
+        max_failures=int(os.getenv("RAG_CB_FAILS", "10")),
+        window_seconds=int(os.getenv("RAG_CB_WINDOW_SEC", "30")),
+        open_duration_seconds=int(os.getenv("RAG_CB_OPEN_SEC", "15"))
+    )
+)
+
 _sem = asyncio.Semaphore(MAX_CONCURRENCY)
-_fail_timestamps: List[float] = []
-_cb_open_until: float = 0.0
 
 
 def _ensure_milvus_connected() -> None:
@@ -103,84 +163,79 @@ def _ensure_milvus_connected() -> None:
         pass
 
 
-def _is_postgres() -> bool:
-    return DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
-
-
-def _db():
-    if _is_postgres():
-        return psycopg2.connect(DATABASE_URL)
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _rows_to_dicts(cur, rows):
-    if _is_postgres():
-        cols = [desc[0] for desc in cur.description]
-        return [dict(zip(cols, r)) for r in rows]
-    return rows
-
-
 def _init_db():
-    conn = _db()
-    cur = conn.cursor()
-    if _is_postgres():
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS sessions(
-                id TEXT PRIMARY KEY,
-                user_id TEXT,
-                created_at DOUBLE PRECISION,
-                metadata TEXT
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS messages(
-                id SERIAL PRIMARY KEY,
-                session_id TEXT,
-                role TEXT,
-                content TEXT,
-                created_at DOUBLE PRECISION
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS feedback(
-                id SERIAL PRIMARY KEY,
-                message_id INTEGER,
-                vote TEXT,
-                comment TEXT,
-                created_at DOUBLE PRECISION
-            )
-        """)
-    else:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS sessions(
-                id TEXT PRIMARY KEY,
-                user_id TEXT,
-                created_at REAL,
-                metadata TEXT
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS messages(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT,
-                role TEXT,
-                content TEXT,
-                created_at REAL
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS feedback(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id INTEGER,
-                vote TEXT,
-                comment TEXT,
-                created_at REAL
-            )
-        """)
-    conn.commit()
-    conn.close()
+    """Initialize database schema"""
+    pool = get_pool()
+    
+    with pool.get_connection() as conn:
+        cur = conn.cursor()
+        
+        is_postgres = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+        
+        if is_postgres:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sessions(
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    created_at DOUBLE PRECISION,
+                    metadata TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS messages(
+                    id SERIAL PRIMARY KEY,
+                    session_id TEXT,
+                    role TEXT,
+                    content TEXT,
+                    created_at DOUBLE PRECISION
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS feedback(
+                    id SERIAL PRIMARY KEY,
+                    message_id INTEGER,
+                    vote TEXT,
+                    comment TEXT,
+                    created_at DOUBLE PRECISION
+                )
+            """)
+            # Add indexes for performance
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_created ON sessions(user_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_message ON feedback(message_id)")
+        else:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sessions(
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    created_at REAL,
+                    metadata TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS messages(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    role TEXT,
+                    content TEXT,
+                    created_at REAL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS feedback(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER,
+                    vote TEXT,
+                    comment TEXT,
+                    created_at REAL
+                )
+            """)
+            # Add indexes for SQLite
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_created ON sessions(user_id, created_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_message ON feedback(message_id)")
 
 
 def _auth_or_401(request: Request):
@@ -191,30 +246,21 @@ def _auth_or_401(request: Request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _cb_check_open() -> bool:
-    return time.time() < _cb_open_until
-
-
-def _cb_record_failure():
-    global _cb_open_until
-    now = time.time()
-    while _fail_timestamps and now - _fail_timestamps[0] > CB_WINDOW_SEC:
-        _fail_timestamps.pop(0)
-    _fail_timestamps.append(now)
-    if len(_fail_timestamps) >= CB_FAILS:
-        _cb_open_until = now + CB_OPEN_SEC
-
-
-def _cb_record_success():
-    if _fail_timestamps:
-        del _fail_timestamps[: max(1, len(_fail_timestamps) // 2)]
-
-
 @app.on_event("startup")
 async def on_startup():
     global pipeline_instance
+    
+    # Initialize database connection pool
+    initialize_pool(
+        database_url=DATABASE_URL,
+        sqlite_path=db_path,
+        min_connections=5,
+        max_connections=20
+    )
+    
     pipeline_instance = _get_pipeline()
     _init_db()
+    
     try:
       endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
       resource = Resource.create({"service.name": "rag-api"})
@@ -231,8 +277,53 @@ async def on_startup():
 
 @app.get("/healthz")
 async def healthz():
+    """Comprehensive health check with dependency verification"""
     REQUEST_COUNTER.labels(endpoint="/healthz", method="GET").inc()
-    return {"status": "ok", "milvus_connected": milvus_ready}
+    
+    health = {
+        "status": "healthy",
+        "checks": {
+            "milvus": "unknown",
+            "database": "unknown",
+            "circuit_breaker": "unknown"
+        },
+        "timestamp": time.time()
+    }
+    
+    # Check Milvus
+    try:
+        if milvus_ready and pipeline_instance:
+            # Quick ping to Milvus
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: pipeline_instance.index_manager.collections["semantic_index"].num_entities
+                ),
+                timeout=2.0
+            )
+            health["checks"]["milvus"] = "healthy"
+    except Exception as e:
+        health["checks"]["milvus"] = f"unhealthy: {str(e)[:100]}"
+        health["status"] = "degraded"
+    
+    # Check Database
+    try:
+        pool = get_pool()
+        with pool.get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            health["checks"]["database"] = "healthy"
+    except Exception as e:
+        health["checks"]["database"] = f"unhealthy: {str(e)[:100]}"
+        health["status"] = "degraded"
+    
+    # Check Circuit Breaker
+    cb_stats = circuit_breaker.get_stats()
+    health["checks"]["circuit_breaker"] = cb_stats["state"]
+    if cb_stats["state"] == "open":
+        health["status"] = "degraded"
+    
+    status_code = 200 if health["status"] in ["healthy", "degraded"] else 503
+    return JSONResponse(content=health, status_code=status_code)
 
 @app.get("/")
 async def root_index():
@@ -240,6 +331,7 @@ async def root_index():
 
 
 @app.post("/ingest")
+@limiter.limit("10/minute")
 async def ingest(req: IngestRequest, request: Request):
     REQUEST_COUNTER.labels(endpoint="/ingest", method="POST").inc()
     _auth_or_401(request)
@@ -250,11 +342,13 @@ async def ingest(req: IngestRequest, request: Request):
 
 
 @app.post("/retrieve")
+@limiter.limit("60/minute")
 async def retrieve(req: RetrieveRequest, request: Request):
     REQUEST_COUNTER.labels(endpoint="/retrieve", method="POST").inc()
     _auth_or_401(request)
     _ensure_milvus_connected()
-    if _cb_check_open():
+    if circuit_breaker.is_open():
+        ERRORS_COUNTER.labels(error_type="circuit_breaker_open").inc()
         raise HTTPException(status_code=503, detail="Temporarily unavailable (circuit open)")
     async with _sem:
         try:
@@ -267,12 +361,14 @@ async def retrieve(req: RetrieveRequest, request: Request):
                     ),
                     timeout=RETRIEVE_TIMEOUT_MS / 1000.0
                 )
-            _cb_record_success()
+            circuit_breaker.record_success()
         except asyncio.TimeoutError:
-            _cb_record_failure()
+            circuit_breaker.record_failure()
+            ERRORS_COUNTER.labels(error_type="timeout").inc()
             raise HTTPException(status_code=504, detail="Retrieve timeout")
-        except Exception:
-            _cb_record_failure()
+        except Exception as e:
+            circuit_breaker.record_failure()
+            ERRORS_COUNTER.labels(error_type="unknown").inc()
             raise
     return {
         "results": [
@@ -292,8 +388,20 @@ async def retrieve(req: RetrieveRequest, request: Request):
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    """Graceful shutdown"""
+    print("Initiating graceful shutdown...")
+    shutdown_event.set()
+    
+    # Wait for in-flight requests to complete (max 2 seconds)
+    await asyncio.sleep(2)
+    
     if pipeline_instance:
         await pipeline_instance.close()
+    
+    # Close database pool
+    close_pool()
+    
+    print("Shutdown complete")
 
 class FeedbackRequest(BaseModel):
     message_id: int
@@ -304,20 +412,23 @@ class FeedbackRequest(BaseModel):
 async def feedback(req: FeedbackRequest, request: Request):
     REQUEST_COUNTER.labels(endpoint="/feedback", method="POST").inc()
     _auth_or_401(request)
-    conn = _db()
-    cur = conn.cursor()
-    if _is_postgres():
-        cur.execute(
-            "INSERT INTO feedback(message_id, vote, comment, created_at) VALUES(%s,%s,%s,%s)",
-            (req.message_id, req.vote, req.comment, time.time())
-        )
-    else:
-        cur.execute(
-            "INSERT INTO feedback(message_id, vote, comment, created_at) VALUES(?,?,?,?)",
-            (req.message_id, req.vote, req.comment, time.time())
-        )
-    conn.commit()
-    conn.close()
+    
+    pool = get_pool()
+    is_postgres = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+    
+    with pool.get_connection() as conn:
+        cur = conn.cursor()
+        if is_postgres:
+            cur.execute(
+                "INSERT INTO feedback(message_id, vote, comment, created_at) VALUES(%s,%s,%s,%s)",
+                (req.message_id, req.vote, req.comment, time.time())
+            )
+        else:
+            cur.execute(
+                "INSERT INTO feedback(message_id, vote, comment, created_at) VALUES(?,?,?,?)",
+                (req.message_id, req.vote, req.comment, time.time())
+            )
+    
     return {"ok": True}
 
 @app.get("/metrics")
@@ -331,71 +442,76 @@ def _new_session_id() -> str:
 
 
 def _save_session(session_id: str, user_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
-    conn = _db()
-    cur = conn.cursor()
-    if _is_postgres():
-        cur.execute(
-            "INSERT INTO sessions(id, user_id, created_at, metadata) VALUES(%s,%s,%s,%s)",
-            (session_id, user_id, time.time(), json.dumps(metadata or {}))
-        )
-    else:
-        cur.execute(
-            "INSERT INTO sessions(id, user_id, created_at, metadata) VALUES(?,?,?,?)",
-            (session_id, user_id, time.time(), json.dumps(metadata or {}))
-        )
-    conn.commit()
-    conn.close()
+    pool = get_pool()
+    is_postgres = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+    
+    with pool.get_connection() as conn:
+        cur = conn.cursor()
+        if is_postgres:
+            cur.execute(
+                "INSERT INTO sessions(id, user_id, created_at, metadata) VALUES(%s,%s,%s,%s)",
+                (session_id, user_id, time.time(), json.dumps(metadata or {}))
+            )
+        else:
+            cur.execute(
+                "INSERT INTO sessions(id, user_id, created_at, metadata) VALUES(?,?,?,?)",
+                (session_id, user_id, time.time(), json.dumps(metadata or {}))
+            )
 
 
 def _append_message(session_id: str, role: str, content: str) -> int:
-    conn = _db()
-    cur = conn.cursor()
-    if _is_postgres():
-        cur.execute(
-            "INSERT INTO messages(session_id, role, content, created_at) VALUES(%s,%s,%s,%s) RETURNING id",
-            (session_id, role, content, time.time())
-        )
-        mid = cur.fetchone()[0]
-    else:
-        cur.execute(
-            "INSERT INTO messages(session_id, role, content, created_at) VALUES(?,?,?,?)",
-            (session_id, role, content, time.time())
-        )
-        mid = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return mid
+    pool = get_pool()
+    is_postgres = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+    
+    with pool.get_connection() as conn:
+        cur = conn.cursor()
+        if is_postgres:
+            cur.execute(
+                "INSERT INTO messages(session_id, role, content, created_at) VALUES(%s,%s,%s,%s) RETURNING id",
+                (session_id, role, content, time.time())
+            )
+            mid = cur.fetchone()[0]
+        else:
+            cur.execute(
+                "INSERT INTO messages(session_id, role, content, created_at) VALUES(?,?,?,?)",
+                (session_id, role, content, time.time())
+            )
+            mid = cur.lastrowid
+        return mid
 
 
 def _get_history(session_id: str) -> List[Dict[str, Any]]:
-    conn = _db()
-    cur = conn.cursor()
-    if _is_postgres():
-        cur.execute(
-            "SELECT id, role, content, created_at FROM messages WHERE session_id=%s ORDER BY id ASC",
-            (session_id,)
-        )
-        rows = cur.fetchall()
-        dicts = _rows_to_dicts(cur, rows)
-    else:
-        rows = cur.execute(
-            "SELECT id, role, content, created_at FROM messages WHERE session_id=? ORDER BY id ASC",
-            (session_id,)
-        ).fetchall()
-        dicts = [{"id": r[0], "role": r[1], "content": r[2], "created_at": r[3]} for r in rows]
-    conn.close()
-    return dicts
+    pool = get_pool()
+    is_postgres = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+    
+    with pool.get_connection() as conn:
+        cur = conn.cursor()
+        if is_postgres:
+            cur.execute(
+                "SELECT id, role, content, created_at FROM messages WHERE session_id=%s ORDER BY id ASC",
+                (session_id,)
+            )
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+            return [dict(zip(cols, r)) for r in rows]
+        else:
+            rows = cur.execute(
+                "SELECT id, role, content, created_at FROM messages WHERE session_id=? ORDER BY id ASC",
+                (session_id,)
+            ).fetchall()
+            return [{"id": r[0], "role": r[1], "content": r[2], "created_at": r[3]} for r in rows]
 
 
 def _clear_session(session_id: str):
-    conn = _db()
-    cur = conn.cursor()
-    if _is_postgres():
-        cur.execute("DELETE FROM messages WHERE session_id=%s", (session_id,))
-    else:
-        cur.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
-    conn.commit()
-    conn.close()
+    pool = get_pool()
+    is_postgres = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+    
+    with pool.get_connection() as conn:
+        cur = conn.cursor()
+        if is_postgres:
+            cur.execute("DELETE FROM messages WHERE session_id=%s", (session_id,))
+        else:
+            cur.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
 
 
 class ChatStartRequest(BaseModel):
@@ -485,14 +601,17 @@ def _generate_suggestions(context_text: str, limit: int = 4) -> List[str]:
 
 
 @app.post("/chat")
+@limiter.limit("30/minute")
 async def chat(req: ChatRequest, request: Request):
     REQUEST_COUNTER.labels(endpoint="/chat", method="POST").inc()
     _auth_or_401(request)
     _ensure_milvus_connected()
     if not milvus_ready:
+        ERRORS_COUNTER.labels(error_type="service_unavailable").inc()
         raise HTTPException(status_code=503, detail="Milvus not connected")
     _append_message(req.session_id, "user", req.query)
-    if _cb_check_open():
+    if circuit_breaker.is_open():
+        ERRORS_COUNTER.labels(error_type="circuit_breaker_open").inc()
         raise HTTPException(status_code=503, detail="Temporarily unavailable (circuit open)")
     async with _sem:
         try:
@@ -505,12 +624,14 @@ async def chat(req: ChatRequest, request: Request):
                     ),
                     timeout=RETRIEVE_TIMEOUT_MS / 1000.0
                 )
-            _cb_record_success()
+            circuit_breaker.record_success()
         except asyncio.TimeoutError:
-            _cb_record_failure()
+            circuit_breaker.record_failure()
+            ERRORS_COUNTER.labels(error_type="timeout").inc()
             raise HTTPException(status_code=504, detail="Retrieve timeout")
-        except Exception:
-            _cb_record_failure()
+        except Exception as e:
+            circuit_breaker.record_failure()
+            ERRORS_COUNTER.labels(error_type="unknown").inc()
             raise
     ans = _make_answer_from_results([{
         "id": r.chunk_id,
