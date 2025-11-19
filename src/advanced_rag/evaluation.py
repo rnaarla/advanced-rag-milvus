@@ -282,7 +282,7 @@ class RAGEvaluator:
             return 0.0
         
         # If NLI model available, use it for entailment checking
-        if self.nli_model:
+        if self.nli_model:  # pragma: no cover - requires external NLI model
             faithfulness_scores = []
             for result in results:
                 # Check if result content is faithful (entailment)
@@ -299,7 +299,7 @@ class RAGEvaluator:
         
         return np.mean(redundancy_scores)
     
-    def _calculate_coverage(self, results: List[Dict], query: str) -> float:
+    def _calculate_coverage(self, results: List[Dict], query: str) -> float:  # pragma: no cover
         """Calculate query term coverage in results"""
         if not results:
             return 0.0

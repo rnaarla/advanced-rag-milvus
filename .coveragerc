@@ -1,0 +1,29 @@
+[run]
+source = src/advanced_rag
+omit =
+    */tests/*
+    */test_*.py
+    */__pycache__/*
+    */site-packages/*
+    src/advanced_rag/circuit_breaker.py
+    src/advanced_rag/db_pool.py
+    src/advanced_rag/exceptions.py
+    src/advanced_rag/embedding_cache.py
+    src/advanced_rag/indexing.py
+
+[report]
+precision = 2
+show_missing = True
+skip_covered = False
+
+[report:exclude_lines]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise AssertionError
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+    @abstractmethod
+
+

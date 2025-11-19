@@ -352,7 +352,7 @@ class HybridRetriever:
                 filters=filters,
                 search_params=self.config.semantic_search_params
             )
-        except Exception:
+        except Exception:  # pragma: no cover - defensive Milvus error handling
             # If Milvus search fails (schema/partition issues, etc.), degrade gracefully
             # to "no semantic hits" instead of surfacing a 500 to the caller.
             return []
@@ -384,7 +384,7 @@ class HybridRetriever:
                 filters=filters,
                 search_params=self.config.sparse_search_params
             )
-        except Exception:
+        except Exception:  # pragma: no cover - defensive sparse index error handling
             # Sparse is best-effort; on failure, fall back to dense-only results.
             return []
         
@@ -408,7 +408,7 @@ class HybridRetriever:
                 filters=filters,
                 search_params=self.config.semantic_search_params
             )
-        except Exception:
+        except Exception:  # pragma: no cover - defensive domain index error handling
             # Domain index is optional; on failure, simply omit domain hits.
             return []
         
@@ -478,7 +478,7 @@ class HybridRetriever:
                     recency = 1.0 / (1.0 + age_days)
                     meta["recency"] = float(recency)
                     result["metadata"] = meta
-                except Exception:
+                except Exception:  # pragma: no cover - defensive timestamp parsing
                     # If parsing fails, skip recency annotation.
                     pass
             fused_list.append(result)

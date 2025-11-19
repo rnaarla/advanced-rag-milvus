@@ -158,6 +158,15 @@ def test_query_classifier_and_profiles_are_used():
     profile2 = classifier.classify("I see an error: connection failed")
     assert profile2 == "troubleshooting"
 
+    # Explicit summary
+    profile_summary = classifier.classify("Please provide a summary or overview of RAG.")
+    assert profile_summary == "summary"
+
+    # Long-form analysis
+    long_query = "x" * 250
+    profile_analysis = classifier.classify(long_query)
+    assert profile_analysis == "analysis"
+
     # Fallback/default
     profile3 = classifier.classify("")
     assert profile3 == "default"
@@ -243,6 +252,28 @@ async def test_rerank_placeholder_scores():
 
 
 @pytest.mark.asyncio
+async def test_rerank_with_external_reranker_scores():
+    """Exercise the external reranker path in HybridRetriever.rerank."""
+    class DummyReranker:
+        async def score(self, pairs):
+            # Return higher score for second item to flip ordering
+            return [0.1, 0.9]
+
+    class DummyRetriever(HybridRetriever):
+        pass
+
+    retriever = DummyRetriever(index_manager=None)
+    retriever.reranker = DummyReranker()
+    results = [
+        {"id": "A", "content": "alpha", "score": 0.5},
+        {"id": "B", "content": "bravo", "score": 0.4},
+    ]
+    reranked = await retriever.rerank(query="q", results=results, top_k=2)
+    assert [r["id"] for r in reranked] == ["B", "A"]
+    assert "rerank_score" in reranked[0]
+
+
+@pytest.mark.asyncio
 async def test_hybrid_retriever_retrieve_with_domain():
     class FakeIndexManager:
         async def _generate_semantic_embedding(self, text: str):
@@ -278,6 +309,26 @@ async def test_hybrid_retriever_retrieve_with_domain():
         elif "retrieval_profile" in r:
             profiles.add(r["retrieval_profile"])
     assert profiles  # at least one profile recorded
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retriever_metadata_fallback_when_no_dict():
+    """When results lack metadata dict, retrieval_profile should be attached at top level."""
+    class FakeIndexManagerNoMeta:
+        async def _generate_semantic_embedding(self, text: str):
+            return np.ones(4, dtype=np.float32)
+
+        async def _generate_sparse_embedding(self, text: str):
+            return np.zeros(4, dtype=np.float32)
+
+        async def search(self, query_embedding, collection_name, top_k=20, filters=None, search_params=None):
+            # Return results without metadata dict to exercise fallback path
+            return [{"id": "Z", "content": "no-metadata", "score": 1.0}]
+
+    retriever = HybridRetriever(index_manager=FakeIndexManagerNoMeta())
+    results = await retriever.retrieve(query="What is RAG?")
+    assert results
+    assert "retrieval_profile" in results[0]
 
 
 @pytest.mark.asyncio
@@ -447,6 +498,21 @@ def test_evaluation_distribution_shift_internal():
     shift = ev._calculate_distribution_shift()
     assert 0.0 <= shift <= 1.0
 
+
+def test_generate_drift_recommendations_thresholds():
+    ev = RAGEvaluator(drift_threshold=0.1)
+    recs = ev._generate_drift_recommendations(
+        drift_magnitude=0.5,
+        embedding_divergence=0.3,
+        distribution_shift=0.4,
+    )
+    # All recommendation branches should be exercised
+    joined = " ".join(recs)
+    assert "Significant drift detected" in joined
+    assert "Embedding space has shifted" in joined
+    assert "Score distribution has changed" in joined
+    assert "A/B testing" in joined or "Increase monitoring frequency" in joined
+
 def test_learned_hybrid_adapter_basic_fit_and_call():
     adapter = LearnedHybridAdapter()
     feedback = [
@@ -506,6 +572,30 @@ def test_query_decomposer_basic_strategies():
     res_complex = decomposer.decompose(complex_q)
     assert len(res_complex.sub_queries) >= 1
     assert isinstance(res_complex.strategy, str)
+
+
+def test_query_rewriter_expansion_and_disable():
+    """QueryRewriter should expand common abbreviations and be configurable."""
+    from advanced_rag.query_rewriting import QueryRewriter, QueryRewriterConfig
+
+    rw = QueryRewriter()
+    # Empty query should be returned as-is
+    assert rw.rewrite("", context={}) == ""
+
+    out_rag = rw.rewrite("Explain RAG architecture", context={})
+    assert "retrieval augmented generation" in out_rag.lower()
+
+    out_llm = rw.rewrite("LLM overview", context={})
+    assert "large language model" in out_llm.lower()
+
+    # Query without known abbreviations should be passed through unchanged
+    plain = "regular question without abbreviations"
+    assert rw.rewrite(plain, context={}) == plain
+
+    # When disabled, rewriting should be a no-op
+    rw_disabled = QueryRewriter(config=QueryRewriterConfig(enable_expansion=False))
+    q = "What is RAG?"
+    assert rw_disabled.rewrite(q, context={}) == q
 
 
 @pytest.mark.asyncio
