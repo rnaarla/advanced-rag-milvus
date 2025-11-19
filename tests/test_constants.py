@@ -14,7 +14,7 @@ import os
 import importlib.util
 
 # Load module directly without triggering __init__.py
-module_path = os.path.join(os.path.dirname(__file__), '../advanced_rag/constants.py')
+module_path = os.path.join(os.path.dirname(__file__), '../src/advanced_rag/constants.py')
 spec = importlib.util.spec_from_file_location("constants", module_path)
 constants = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(constants)
@@ -29,6 +29,12 @@ APIConstants = constants.APIConstants
 MilvusConstants = constants.MilvusConstants
 ComplianceConstants = constants.ComplianceConstants
 LoggingConstants = constants.LoggingConstants
+
+# Additional constant classes introduced for advanced configuration
+EmbeddingConstants = constants.EmbeddingConstants
+IndexingConstants = constants.IndexingConstants
+RateLimitConstants = constants.RateLimitConstants
+MetricsConstants = constants.MetricsConstants
 
 
 class TestChunkingConstants:

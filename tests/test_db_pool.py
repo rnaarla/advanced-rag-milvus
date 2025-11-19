@@ -21,15 +21,18 @@ import os
 import importlib.util
 
 # Load module directly without triggering __init__.py
-module_path = os.path.join(os.path.dirname(__file__), '../advanced_rag/db_pool.py')
+module_path = os.path.join(os.path.dirname(__file__), '../src/advanced_rag/db_pool.py')
 spec = importlib.util.spec_from_file_location("db_pool", module_path)
 db_pool = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(db_pool)
+# Register under this name so patch('db_pool.psycopg2') works reliably
+sys.modules["db_pool"] = db_pool
 
 initialize_pool = db_pool.initialize_pool
 get_pool = db_pool.get_pool
 close_pool = db_pool.close_pool
 DatabasePool = db_pool.DatabasePool
+get_pool_stats = db_pool.get_pool_stats
 
 
 class TestDatabaseConnectionPool:
@@ -54,7 +57,7 @@ class TestDatabaseConnectionPool:
     
     def test_postgres_pool_initialization(self):
         """Test PostgreSQL pool initialization (mocked)"""
-        with patch('advanced_rag.db_pool.psycopg2') as mock_psycopg2:
+        with patch('db_pool.psycopg2') as mock_psycopg2:
             mock_pool = MagicMock()
             mock_psycopg2.pool.ThreadedConnectionPool.return_value = mock_pool
             
@@ -197,7 +200,7 @@ class TestDatabaseConnectionPool:
     
     def test_postgres_connection_acquisition_mocked(self):
         """Test PostgreSQL connection acquisition (mocked)"""
-        with patch('advanced_rag.db_pool.psycopg2') as mock_psycopg2:
+        with patch('db_pool.psycopg2') as mock_psycopg2:
             mock_pool = MagicMock()
             mock_conn = MagicMock()
             mock_pool.getconn.return_value = mock_conn
@@ -214,7 +217,7 @@ class TestDatabaseConnectionPool:
     
     def test_postgres_connection_error_handling(self):
         """Test PostgreSQL connection error handling (mocked)"""
-        with patch('advanced_rag.db_pool.psycopg2') as mock_psycopg2:
+        with patch('db_pool.psycopg2') as mock_psycopg2:
             mock_pool = MagicMock()
             mock_conn = MagicMock()
             mock_conn.cursor.side_effect = Exception("Connection error")
@@ -248,7 +251,7 @@ class TestDatabaseConnectionPool:
     
     def test_postgres_pool_close_mocked(self):
         """Test PostgreSQL pool close (mocked)"""
-        with patch('advanced_rag.db_pool.psycopg2') as mock_psycopg2:
+        with patch('db_pool.psycopg2') as mock_psycopg2:
             mock_pool = MagicMock()
             mock_psycopg2.pool.ThreadedConnectionPool.return_value = mock_pool
             

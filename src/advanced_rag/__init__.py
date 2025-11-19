@@ -33,6 +33,25 @@ from .retrieval import (
     CrossEncoderReranker
 )
 
+from .ranker import (
+    LearnedRanker,
+    LearnedRankerConfig,
+)
+
+from .semantic_enrichment import (
+    SemanticEnricher,
+    EnrichmentResult,
+)
+
+from .decomposition import (
+    QueryDecomposer,
+    DecompositionResult,
+)
+
+from .experiments import (
+    ExperimentManager,
+)
+
 from .evaluation import (
     RAGEvaluator,
     EvaluationMetrics,
@@ -73,6 +92,13 @@ __all__ = [
     "HybridRetriever",
     "RetrievalConfig",
     "CrossEncoderReranker",
+    "LearnedRanker",
+    "LearnedRankerConfig",
+    "SemanticEnricher",
+    "EnrichmentResult",
+    "QueryDecomposer",
+    "DecompositionResult",
+    "ExperimentManager",
     
     # Evaluation
     "RAGEvaluator",

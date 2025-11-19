@@ -12,7 +12,57 @@ from typing import Callable, Tuple
 import re
 import logging
 
+from .ranker import LearnedRanker
+
 logger = logging.getLogger(__name__)
+
+
+class QueryClassifier:
+    """
+    Lightweight query classifier to route requests to retrieval profiles.
+    Heuristics are intentionally simple and deterministic so they are safe
+    to run synchronously on the hot path.
+    """
+
+    def __init__(self, max_faq_len: int = 80, long_query_len: int = 200):
+        self.max_faq_len = max_faq_len
+        self.long_query_len = long_query_len
+
+    def classify(self, query: str) -> str:
+        """
+        Classify the query into a coarse profile:
+        - faq: short question-style lookups
+        - troubleshooting: mentions errors/exceptions/failures
+        - summary: explicit summarization/overview requests
+        - analysis: long-form, open-ended analysis
+        - default: everything else
+        """
+        if not query:
+            return "default"
+
+        q = query.strip()
+        if not q:
+            return "default"
+
+        q_lower = q.lower()
+
+        # Troubleshooting-style queries
+        if any(token in q_lower for token in ("error", "exception", "stack trace", "failed", "failure", "bug")):
+            return "troubleshooting"
+
+        # Explicit summarization
+        if any(token in q_lower for token in ("summarize", "summary", "tl;dr", "overview")):
+            return "summary"
+
+        # Short question-style lookups
+        if len(q) <= self.max_faq_len and q.endswith("?"):
+            return "faq"
+
+        # Long-form analytical queries
+        if len(q) >= self.long_query_len:
+            return "analysis"
+
+        return "default"
 
 
 @dataclass
@@ -26,6 +76,8 @@ class RetrievalConfig:
     sparse_weight: float = 0.3
     enable_mmr: bool = False
     mmr_lambda: float = 0.7  # 1.0 favors relevance; 0.0 favors diversity
+    # Learned ranker flag (applies within rerank())
+    enable_learned_ranker: bool = False
     # Adaptive hybrid weighting hook (query -> (dense_weight, sparse_weight))
     # Set via HybridRetriever(weight_adapter=...)
     # Not serialized; runtime only.
@@ -60,20 +112,86 @@ class HybridRetriever:
         self,
         index_manager: 'MilvusIndexManager',
         config: Optional[RetrievalConfig] = None,
-        weight_adapter: Optional[Callable[[str], Tuple[float, float]]] = None
+        weight_adapter: Optional[Callable[[str], Tuple[float, float]]] = None,
+        classifier: Optional[QueryClassifier] = None,
+        profiles: Optional[Dict[str, RetrievalConfig]] = None,
+        learned_ranker: Optional[LearnedRanker] = None,
     ):
         """
         Args:
             index_manager: MilvusIndexManager instance
-            config: Retrieval configuration
+            config: Base retrieval configuration
+            weight_adapter: Optional adaptive weight hook
+            classifier: Optional query classifier to choose retrieval profiles
+            profiles: Optional map of profile_name -> RetrievalConfig
         """
         self.index_manager = index_manager
-        self.config = config or RetrievalConfig()
+        base_config = config or RetrievalConfig()
+        self.config = base_config
         self.weight_adapter = weight_adapter
-        
-        # Reranker (placeholder - integrate actual cross-encoder)
-        self.reranker = None  # Will be set externally
-    
+        self.classifier = classifier or QueryClassifier()
+        # Build default profiles if none provided
+        self.profiles: Dict[str, RetrievalConfig] = profiles or self._build_default_profiles(base_config)
+
+        # Rerankers
+        self.reranker = None  # Cross-encoder or other reranker; set externally
+        self.learned_ranker: Optional[LearnedRanker] = learned_ranker
+
+    @staticmethod
+    def _build_default_profiles(base_config: RetrievalConfig) -> Dict[str, RetrievalConfig]:
+        """
+        Construct a small set of retrieval profiles.
+        The base_config is used for the 'default' profile so existing
+        behavior is preserved when classification is not in use.
+        """
+        profiles: Dict[str, RetrievalConfig] = {}
+        profiles["default"] = base_config
+        # Short FAQ-style lookups: smaller top_k, reranking enabled, modest MMR.
+        profiles["faq"] = RetrievalConfig(
+            hybrid_alpha=base_config.hybrid_alpha,
+            top_k=10,
+            rerank_top_k=5,
+            enable_reranking=True,
+            dense_weight=base_config.dense_weight,
+            sparse_weight=base_config.sparse_weight,
+            enable_mmr=False,
+            mmr_lambda=0.7,
+        )
+        # Troubleshooting: over-retrieve, use MMR to diversify similar snippets.
+        profiles["troubleshooting"] = RetrievalConfig(
+            hybrid_alpha=base_config.hybrid_alpha,
+            top_k=max(base_config.top_k, 30),
+            rerank_top_k=10,
+            enable_reranking=True,
+            dense_weight=base_config.dense_weight,
+            sparse_weight=base_config.sparse_weight,
+            enable_mmr=True,
+            mmr_lambda=0.5,
+        )
+        # Summaries: pull more context but often aggregate, reranking optional.
+        profiles["summary"] = RetrievalConfig(
+            hybrid_alpha=base_config.hybrid_alpha,
+            top_k=max(base_config.top_k, 40),
+            rerank_top_k=10,
+            enable_reranking=False,
+            dense_weight=base_config.dense_weight,
+            sparse_weight=base_config.sparse_weight,
+            enable_mmr=False,
+            mmr_lambda=0.7,
+        )
+        # Long-form analysis: more context and diversification.
+        profiles["analysis"] = RetrievalConfig(
+            hybrid_alpha=base_config.hybrid_alpha,
+            top_k=max(base_config.top_k, 30),
+            rerank_top_k=10,
+            enable_reranking=True,
+            dense_weight=base_config.dense_weight,
+            sparse_weight=base_config.sparse_weight,
+            enable_mmr=True,
+            mmr_lambda=0.8,
+        )
+        return profiles
+
     async def retrieve(
         self,
         query: str,
@@ -91,8 +209,22 @@ class HybridRetriever:
             domain: Domain identifier
             
         Returns:
-            List of retrieved documents with scores
+            List of retrieved documents with scores. Each result will include
+            the retrieval profile used for this query in its metadata.
         """
+        # Choose retrieval profile for this query (safe default on any error)
+        profile_name = "default"
+        try:
+            if self.classifier:
+                profile_name = self.classifier.classify(query) or "default"
+        except Exception:
+            profile_name = "default"
+
+        profile_config = self.profiles.get(profile_name, self.config)
+        # Use the selected profile config for this request. This is mutable by
+        # design (e.g., weight_adapter may update dense/sparse weights).
+        self.config = profile_config
+
         # Generate query embeddings
         semantic_emb = await self._get_semantic_embedding(query)
         sparse_emb = await self._get_sparse_embedding(query)
@@ -134,8 +266,18 @@ class HybridRetriever:
             sparse_results=results_list[1],
             domain_results=results_list[2] if len(results_list) > 2 else []
         )
-        
-        # Return top-k
+
+        # Attach profile metadata for downstream logging/analysis
+        for result in fused_results:
+            metadata = result.get("metadata")
+            if isinstance(metadata, dict):
+                metadata.setdefault("retrieval_profile", profile_name)
+                result["metadata"] = metadata
+            else:
+                # Fallback when tests or callers don't use metadata dicts
+                result["retrieval_profile"] = profile_name
+
+        # Return top-k for the active profile
         return fused_results[:self.config.top_k]
     
     async def _search_semantic(
@@ -325,9 +467,11 @@ class HybridRetriever:
         
         # Generate pairs for reranking
         pairs = [(query, result["content"]) for result in results]
-        
+
         # Get reranking scores
-        if self.reranker:
+        if self.learned_ranker and self.config.enable_learned_ranker:
+            rerank_scores = await self.learned_ranker.score(query, results)
+        elif self.reranker:
             rerank_scores = await self.reranker.score(pairs)
         else:
             # Placeholder: use existing scores with small perturbation

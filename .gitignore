@@ -32,11 +32,15 @@ env/
 .coverage
 .coverage.*
 htmlcov/
-coverage_report/
 .tox/
 .hypothesis/
 
-# Reports & Documentation (generated)
+coverage_report/
+
+# Local reports & notes (keep in repo only what you really want to publish)
+GIT_COMMIT_SUMMARY.md
+IMPLEMENTATION_SUMMARY.md
+FINAL_REPORT.md
 OPTIMIZATION_REPORT.md
 TEST_COVERAGE_REPORT.md
 TEST_SUMMARY.md
@@ -65,6 +69,7 @@ QUICK_REFERENCE.md
 # Logs
 *.log
 logs/
+uvicorn.out
 
 # Volumes (Milvus, etcd, minio data)
 volumes/

@@ -28,7 +28,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-from advanced_rag import AdvancedRAGPipeline, PipelineConfig
+from advanced_rag import AdvancedRAGPipeline, PipelineConfig, ExperimentManager
 from advanced_rag.db_pool import initialize_pool, get_pool, close_pool
 from advanced_rag.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerOpenError
 from advanced_rag.exceptions import ValidationError
@@ -147,6 +147,40 @@ circuit_breaker = CircuitBreaker(
 )
 
 _sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
+# Simple experiment manager for retrieval strategy selection
+experiment_manager = ExperimentManager(
+    epsilon=float(os.getenv("EXPERIMENT_EPSILON", "0.1"))
+)
+experiment_manager.register_experiment(
+    "retrieval_strategy",
+    ["baseline", "mmr", "learned_ranker"],
+)
+
+
+def _apply_retrieval_variant(variant: str) -> str:
+    """
+    Apply a retrieval strategy variant to the pipeline's retriever config.
+
+    This function mutates the in-memory config; in a multi-worker /
+    multi-process setup, strategies would typically be encoded via
+    request-scoped config instead.
+    """
+    if not pipeline_instance:
+        return "baseline"
+    cfg = pipeline_instance.retriever.config
+    if variant == "mmr":
+        cfg.enable_mmr = True
+        cfg.enable_learned_ranker = False
+    elif variant == "learned_ranker":
+        cfg.enable_mmr = False
+        cfg.enable_learned_ranker = True
+    else:
+        # baseline
+        cfg.enable_mmr = False
+        cfg.enable_learned_ranker = False
+        variant = "baseline"
+    return variant
 
 
 def _ensure_milvus_connected() -> None:
@@ -353,6 +387,9 @@ async def retrieve(req: RetrieveRequest, request: Request):
     async with _sem:
         try:
             with RETRIEVE_LATENCY.time():
+                # Choose and apply retrieval strategy variant for this request
+                variant = experiment_manager.choose_variant("retrieval_strategy") or "baseline"
+                active_variant = _apply_retrieval_variant(variant)
                 results, metrics = await asyncio.wait_for(
                     pipeline_instance.retrieve(
                         query=req.query,
@@ -382,7 +419,10 @@ async def retrieve(req: RetrieveRequest, request: Request):
             }
             for r in results
         ],
-        "metrics": metrics.to_dict()
+        "metrics": metrics.to_dict(),
+        "experiment": {
+            "retrieval_strategy": active_variant,
+        },
     }
 
 

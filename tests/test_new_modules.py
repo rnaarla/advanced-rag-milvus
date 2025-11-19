@@ -16,7 +16,7 @@ from enum import Enum
 
 # Load modules directly without triggering __init__.py
 def load_module(module_name, file_name):
-    module_path = os.path.join(os.path.dirname(__file__), f'../advanced_rag/{file_name}')
+    module_path = os.path.join(os.path.dirname(__file__), f'../src/advanced_rag/{file_name}')
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -82,7 +82,7 @@ class TestDatabasePool:
         with tempfile.NamedTemporaryFile(delete=False) as tf:
             db_pool.initialize_pool(sqlite_path=tf.name)
             db_pool.close_pool()
-            with pytest.raises(RuntimeError, match="not initialized"):
+            with pytest.raises(RuntimeError, match="not been initialized"):
                 db_pool.get_pool()
             os.unlink(tf.name)
     
@@ -212,7 +212,8 @@ class TestCircuitBreaker:
 class TestEmbeddingCache:
     """Test embedding cache with LRU and TTL"""
     
-    def test_cache_init(self):
+    @pytest.mark.asyncio
+    async def test_cache_init(self):
         """Test cache initialization"""
         cache = embedding_cache.EmbeddingCache(maxsize=100, ttl_seconds=300)
         assert cache.maxsize == 100
@@ -220,44 +221,48 @@ class TestEmbeddingCache:
         assert cache._stats.hits == 0
         assert cache._stats.misses == 0
     
-    def test_cache_get_put(self):
+    @pytest.mark.asyncio
+    async def test_cache_get_put(self):
         """Test cache get and put"""
         cache = embedding_cache.EmbeddingCache(maxsize=10)
         
         emb = np.array([0.1, 0.2, 0.3])
-        cache.put("test text", "model1", emb)
+        await cache.put("test text", "model1", emb)
         
-        result = cache.get("test text", "model1")
+        result = await cache.get("test text", "model1")
         assert result is not None
         assert np.array_equal(result, emb)
         assert cache._stats.hits == 1
     
-    def test_cache_miss(self):
+    @pytest.mark.asyncio
+    async def test_cache_miss(self):
         """Test cache miss"""
         cache = embedding_cache.EmbeddingCache(maxsize=10)
         
-        result = cache.get("nonexistent", "model1")
+        result = await cache.get("nonexistent", "model1")
         assert result is None
         assert cache._stats.misses == 1
     
-    def test_cache_disabled(self):
+    @pytest.mark.asyncio
+    async def test_cache_disabled(self):
         """Test disabled cache"""
         cache = embedding_cache.EmbeddingCache(maxsize=10, enabled=False)
         
         emb = np.array([0.1, 0.2, 0.3])
-        cache.put("test", "model1", emb)
+        await cache.put("test", "model1", emb)
         
-        result = cache.get("test", "model1")
+        result = await cache.get("test", "model1")
         assert result is None
     
-    def test_cache_stats_property(self):
+    @pytest.mark.asyncio
+    async def test_cache_stats_property(self):
         """Test cache statistics"""
         cache = embedding_cache.EmbeddingCache(maxsize=10)
         
         emb = np.array([1.0])
-        cache.put("text1", "model1", emb)
-        cache.get("text1", "model1")  # hit
-        cache.get("text2", "model1")  # miss
+        await cache.put("text1", "model1", emb)
+        await cache.get("text1", "model1")  # hit
+        await cache.get("text2", "model1")  # miss
         
         stats = cache._stats
         assert stats.hits == 1
@@ -265,16 +270,17 @@ class TestEmbeddingCache:
         hit_rate = stats.hit_rate
         assert 0.0 <= hit_rate <= 1.0
     
-    def test_cache_eviction_tracking(self):
+    @pytest.mark.asyncio
+    async def test_cache_eviction_tracking(self):
         """Test cache eviction tracking"""
         cache = embedding_cache.EmbeddingCache(maxsize=2)
         
         # Fill cache
-        cache.put("text1", "model1", np.array([1.0]))
-        cache.put("text2", "model1", np.array([2.0]))
+        await cache.put("text1", "model1", np.array([1.0]))
+        await cache.put("text2", "model1", np.array([2.0]))
         
         # This should trigger eviction
-        cache.put("text3", "model1", np.array([3.0]))
+        await cache.put("text3", "model1", np.array([3.0]))
         
         assert cache._stats.evictions >= 1
 

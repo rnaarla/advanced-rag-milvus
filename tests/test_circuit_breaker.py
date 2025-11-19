@@ -18,7 +18,7 @@ import os
 import importlib.util
 
 # Load module directly without triggering __init__.py
-module_path = os.path.join(os.path.dirname(__file__), '../advanced_rag/circuit_breaker.py')
+module_path = os.path.join(os.path.dirname(__file__), '../src/advanced_rag/circuit_breaker.py')
 spec = importlib.util.spec_from_file_location("circuit_breaker", module_path)
 circuit_breaker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(circuit_breaker)

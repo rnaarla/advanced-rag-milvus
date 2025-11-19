@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "advanced-rag-milvus"
+version = "0.1.0"
+description = "Advanced Retrieval-Augmented Generation pipeline backed by Milvus, FastAPI, and AWS-ready infra."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "Advanced RAG Maintainers" }
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Framework :: FastAPI",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+]
+
+dependencies = [
+  "pymilvus>=2.3.0",
+  "numpy>=1.24.0",
+  "scipy>=1.10.0",
+  "pyyaml>=6.0.0",
+  "fastapi>=0.110.0",
+  "uvicorn>=0.29.0",
+  "pydantic>=2.4.0",
+  "prometheus-client>=0.20.0",
+  "opentelemetry-sdk>=1.26.0",
+  "opentelemetry-exporter-otlp>=1.26.0",
+  "opentelemetry-instrumentation-fastapi>=0.47b0",
+  "opentelemetry-instrumentation-requests>=0.47b0",
+  "psycopg2-binary>=2.9.9",
+  "SQLAlchemy>=2.0.0",
+  "alembic>=1.13.1",
+  "slowapi>=0.1.9",
+  "tenacity>=8.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4.0",
+  "pytest-asyncio>=0.21.0",
+  "coverage>=7.0.0",
+  "black>=23.0.0",
+  "flake8>=6.0.0",
+  "pip-audit>=2.7.0",
+  "bandit>=1.7.5",
+]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["advanced_rag*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests", "test_advanced_rag.py", "test_extended.py"]
+
+[tool.coverage.run]
+branch = true
+source = ["advanced_rag"]
+
+[tool.coverage.report]
+show_missing = true
+
+

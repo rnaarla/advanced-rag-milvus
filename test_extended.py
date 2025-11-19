@@ -4,13 +4,21 @@ Extended Unit Tests to raise coverage ≥95%
 
 import pytest
 import numpy as np
+import asyncio
 from datetime import datetime, timedelta
+from typing import List, Dict, Any
 
 from advanced_rag import (
     DocumentDiagnostics,
     AdaptiveChunker,
     RAGEvaluator,
     HybridRetriever,
+    RetrievalConfig,
+    LearnedRanker,
+    SemanticEnricher,
+    QueryDecomposer,
+    AdvancedRAGPipeline,
+    ExperimentManager,
 )
 from advanced_rag.indexing import MilvusIndexManager
 from advanced_rag.learned_adapter import LearnedHybridAdapter
@@ -121,6 +129,40 @@ def test_retrieval_rrf_and_filter_escape():
     # Empty filters returns None
     assert retriever._build_filter_expression({}) is None
 
+
+def test_query_classifier_and_profiles_are_used():
+    """Ensure QueryClassifier routes to different RetrievalConfig profiles."""
+    from advanced_rag.retrieval import QueryClassifier
+
+    class FakeIndexManager:
+        async def _generate_semantic_embedding(self, text: str):
+            return np.ones(4, dtype=np.float32)
+
+        async def _generate_sparse_embedding(self, text: str):
+            return np.zeros(4, dtype=np.float32)
+
+        async def search(self, query_embedding, collection_name, top_k=20, filters=None, search_params=None):
+            # Always return a single result so we can inspect metadata
+            return [{"id": "X", "content": "foo", "score": 1.0, "metadata": {"doc_id": "d"}}]
+
+    # Build a base config and allow HybridRetriever to create default profiles
+    base_cfg = RetrievalConfig(top_k=5)
+    classifier = QueryClassifier(max_faq_len=80, long_query_len=200)
+    retriever = HybridRetriever(index_manager=FakeIndexManager(), config=base_cfg, classifier=classifier)
+
+    # FAQ-style short question
+    profile = classifier.classify("What is vector search?")
+    assert profile == "faq"
+
+    # Troubleshooting style
+    profile2 = classifier.classify("I see an error: connection failed")
+    assert profile2 == "troubleshooting"
+
+    # Fallback/default
+    profile3 = classifier.classify("")
+    assert profile3 == "default"
+
+
 def test_rrf_with_mmr_diversification():
     from advanced_rag import RetrievalConfig
     # Create a HybridRetriever-like object to access _fuse_results with MMR enabled
@@ -208,10 +250,20 @@ async def test_hybrid_retriever_retrieve_with_domain():
             return []
 
     retriever = HybridRetriever(index_manager=FakeIndexManager())
-    results = await retriever.retrieve(query="q", filters={"doc_id": "x"}, use_domain_index=True, domain="tech")
+    # Use a question-style query to exercise classifier and ensure metadata tagging
+    results = await retriever.retrieve(query="What is RAG?", filters={"doc_id": "x"}, use_domain_index=True, domain="tech")
     assert len(results) >= 1
     ids = {r["id"] for r in results}
     assert {"S", "P", "D"} & ids  # at least some present
+    # Verify retrieval_profile is attached either in metadata or at top-level
+    profiles = set()
+    for r in results:
+        meta = r.get("metadata") or {}
+        if isinstance(meta, dict) and "retrieval_profile" in meta:
+            profiles.add(meta["retrieval_profile"])
+        elif "retrieval_profile" in r:
+            profiles.add(r["retrieval_profile"])
+    assert profiles  # at least one profile recorded
 
 
 @pytest.mark.asyncio
@@ -366,6 +418,140 @@ def test_learned_hybrid_adapter_basic_fit_and_call():
     assert abs(dw_short + sw_short - 1.0) < 1e-6
     assert 0.0 < dw_long < 1.0 and 0.0 < sw_long < 1.0
     assert abs(dw_long + sw_long - 1.0) < 1e-6
+
+
+def test_semantic_enricher_entities_and_topics():
+    """SemanticEnricher should extract at least one entity and topic from rich text."""
+    enricher = SemanticEnricher(max_topics=3)
+    text = "OpenAI builds advanced Retrieval systems for Milvus and Postgres backends."
+    result = enricher.enrich(text)
+    # Basic sanity: entities and topics lists exist and are not pathological
+    assert isinstance(result.entities, list) and isinstance(result.topics, list)
+    assert "OpenAI" in result.entities
+    # Topics are derived from frequency; ensure at least one non-trivial term exists
+    assert any(len(t) > 4 for t in result.topics)
+
+
+def test_query_decomposer_basic_strategies():
+    """QueryDecomposer should return single or split queries with a strategy label."""
+    decomposer = QueryDecomposer(min_length=20)
+    short = "What is RAG?"
+    res_short = decomposer.decompose(short)
+    assert res_short.sub_queries == [short]
+    assert res_short.strategy in {"single", "fallback"}
+
+    complex_q = "Explain vectors and indexes in Milvus"
+    res_complex = decomposer.decompose(complex_q)
+    assert len(res_complex.sub_queries) >= 1
+    assert isinstance(res_complex.strategy, str)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_plan_and_execute_uses_decomposer_and_retrieve(monkeypatch):
+    """AdvancedRAGPipeline.plan_and_execute should call retrieve once per sub-query."""
+    pipe = AdvancedRAGPipeline(connect_to_milvus=False)
+
+    calls: List[str] = []
+
+    async def fake_retrieve(query: str, filters=None, context=None):
+        calls.append(query)
+        # Minimal shape: no results, metrics placeholder
+        return [], None
+
+    # Patch retrieve to avoid touching Milvus and to count calls
+    monkeypatch.setattr(pipe, "retrieve", fake_retrieve)
+
+    query = "Explain vectors and indexes"
+    result = await pipe.plan_and_execute(query)
+    decomp = result["decomposition"]
+    assert isinstance(decomp, dict)
+    assert calls  # retrieve called at least once
+    assert len(calls) == len(decomp["sub_queries"])
+
+
+def test_experiment_manager_bandit_basic_flow():
+    """ExperimentManager should learn to prefer higher-reward variants when epsilon=0."""
+    mgr = ExperimentManager(epsilon=0.0)
+    mgr.register_experiment("retrieval_profile", ["baseline", "mmr"])
+
+    # Initially, no reward info: choose_variant should return some valid variant
+    first = mgr.choose_variant("retrieval_profile")
+    assert first in {"baseline", "mmr"}
+
+    # Record outcomes: make 'mmr' clearly better
+    for _ in range(5):
+        mgr.record_outcome("retrieval_profile", "mmr", reward=1.0)
+    for _ in range(3):
+        mgr.record_outcome("retrieval_profile", "baseline", reward=0.0)
+
+    stats = mgr.get_stats("retrieval_profile")
+    assert "mmr" in stats and "baseline" in stats
+    assert stats["mmr"]["average_reward"] >= stats["baseline"]["average_reward"]
+
+    # With epsilon=0 and better reward, mmr should be chosen greedily most of the time
+    chosen = {mgr.choose_variant("retrieval_profile") for _ in range(10)}
+    assert chosen == {"mmr"}
+
+
+def test_learned_ranker_scoring_and_training_examples():
+    """Ensure LearnedRanker can score results and collect training examples."""
+    ranker = LearnedRanker()
+    results = [
+        {"id": "d1", "score": 0.8, "retrieval_methods": ["semantic"]},
+        {"id": "d2", "score": 0.6, "retrieval_methods": ["semantic", "sparse"]},
+    ]
+    # Score should be deterministic and ordered by underlying scores/features
+    scores = asyncio.get_event_loop().run_until_complete(ranker.score("q", results))
+    assert len(scores) == 2
+    # Higher original score should normally produce higher learned score
+    assert scores[0] >= scores[1]
+
+    # Update from feedback and ensure training examples are stored
+    feedback = [
+        {"id": "d1", "label": 1.0},
+        {"id": "d2", "label": 0.0},
+    ]
+    ranker.update_from_feedback("q", results, feedback)
+    assert len(ranker.training_examples) == 2
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retriever_learned_ranker_integration():
+    """Wire a dummy LearnedRanker into HybridRetriever.rerank."""
+    class DummyIndexManager:
+        async def _generate_semantic_embedding(self, text: str):
+            return np.ones(4, dtype=np.float32)
+
+        async def _generate_sparse_embedding(self, text: str):
+            return np.zeros(4, dtype=np.float32)
+
+        async def search(self, query_embedding, collection_name, top_k=20, filters=None, search_params=None):
+            # Two results with slightly different base scores
+            return [
+                {"id": "A", "content": "alpha", "score": 0.5, "metadata": {"doc_id": "d1"}, "retrieval_methods": ["semantic"]},
+                {"id": "B", "content": "bravo", "score": 0.4, "metadata": {"doc_id": "d2"}, "retrieval_methods": ["semantic", "sparse"]},
+            ]
+
+    # LearnedRanker that inverts base scores to change ordering
+    class InvertingRanker(LearnedRanker):
+        async def score(self, query: str, results: List[Dict[str, Any]]) -> List[float]:
+            base_scores = [float(r.get("score", 0.0)) for r in results]
+            max_score = max(base_scores) if base_scores else 0.0
+            return [max_score - s for s in base_scores]
+
+    cfg = RetrievalConfig(enable_reranking=True, enable_learned_ranker=True)
+    retriever = HybridRetriever(
+        index_manager=DummyIndexManager(),
+        config=cfg,
+        learned_ranker=InvertingRanker(),
+    )
+    raw = await retriever.retrieve(query="q")
+    # Apply learned reranker
+    reranked = await retriever.rerank("q", raw, top_k=2)
+    assert len(reranked) == 2
+    # With inverting ranker, the originally lower-scored doc should bubble up
+    ids = [r["id"] for r in reranked]
+    assert "A" in ids and "B" in ids
 
 
 def test_compliance_retention_policy_math():

@@ -14,8 +14,11 @@ from .diagnostics import DocumentDiagnostics, DiagnosticMetrics
 from .chunking import AdaptiveChunker, ChunkMetadata
 from .indexing import MilvusIndexManager, IndexType
 from .retrieval import HybridRetriever, RetrievalConfig
+from .ranker import LearnedRanker
 from .evaluation import RAGEvaluator, EvaluationMetrics
 from .compliance import ComplianceManager, AuditLog
+from .semantic_enrichment import SemanticEnricher
+from .decomposition import QueryDecomposer, DecompositionResult
 
 
 class PipelineStage(Enum):
@@ -82,6 +85,8 @@ class AdvancedRAGPipeline:
         # Initialize core components
         self.diagnostics = DocumentDiagnostics()
         self.chunker = AdaptiveChunker()
+        self.enricher = SemanticEnricher()
+        self.decomposer = QueryDecomposer()
         self.index_manager = MilvusIndexManager(
             host=milvus_host,
             port=milvus_port,
@@ -93,8 +98,9 @@ class AdvancedRAGPipeline:
             config=RetrievalConfig(
                 hybrid_alpha=self.config.hybrid_alpha,
                 top_k=self.config.top_k,
-                enable_reranking=self.config.enable_reranking
-            )
+                enable_reranking=self.config.enable_reranking,
+            ),
+            learned_ranker=LearnedRanker(),
         )
         self.evaluator = RAGEvaluator()
         self.compliance = ComplianceManager(
@@ -165,6 +171,12 @@ class AdvancedRAGPipeline:
                 (datetime.now() - stage_start).total_seconds() * 1000
             )
             
+            # Per-chunk semantic enrichment (entities, topics)
+            for chunk in chunks:
+                enrichment = self.enricher.enrich(chunk.text)
+                chunk.metadata.extra.setdefault("entities", enrichment.entities)
+                chunk.metadata.extra.setdefault("topics", enrichment.topics)
+
             all_chunks.extend(chunks)
             ingestion_report["chunks_created"] += len(chunks)
         
@@ -282,6 +294,45 @@ class AdvancedRAGPipeline:
             print(f"WARNING: SLA violation - latency {total_latency:.2f}ms exceeds target {self.config.target_latency_ms}ms")
         
         return formatted_results, eval_metrics
+    
+    async def plan_and_execute(
+        self,
+        query: str,
+        filters: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Plan-and-execute flow for complex queries.
+        
+        - Decompose the query into sub-queries.
+        - Run the standard retrieve() flow for each sub-query.
+        - Return aggregated results and basic metadata.
+        """
+        plan: DecompositionResult = self.decomposer.decompose(query)
+        subquery_results: List[Dict[str, Any]] = []
+        
+        for sub_query in plan.sub_queries:
+            # Reuse existing retrieve() to keep behaviour consistent.
+            results, metrics = await self.retrieve(
+                query=sub_query,
+                filters=filters,
+                context=context,
+            )
+            subquery_results.append(
+                {
+                    "query": sub_query,
+                    "results": results,
+                    "metrics": metrics,
+                }
+            )
+        
+        return {
+            "decomposition": {
+                "sub_queries": plan.sub_queries,
+                "strategy": plan.strategy,
+            },
+            "subqueries": subquery_results,
+        }
     
     async def detect_drift(self, sample_queries: List[str]) -> Dict[str, Any]:
         """

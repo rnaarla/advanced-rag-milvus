@@ -14,7 +14,7 @@ import os
 import importlib.util
 
 # Load module directly without triggering __init__.py
-module_path = os.path.join(os.path.dirname(__file__), '../advanced_rag/exceptions.py')
+module_path = os.path.join(os.path.dirname(__file__), '../src/advanced_rag/exceptions.py')
 spec = importlib.util.spec_from_file_location("exceptions", module_path)
 exceptions = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(exceptions)
@@ -32,6 +32,15 @@ EvaluationError = exceptions.EvaluationError
 ComplianceError = exceptions.ComplianceError
 MilvusConnectionError = exceptions.MilvusConnectionError
 MilvusOperationError = exceptions.MilvusOperationError
+
+# Extended hierarchy used in advanced tests
+AdvancedRAGException = exceptions.AdvancedRAGException
+EmbeddingError = exceptions.EmbeddingError
+DatabaseError = exceptions.DatabaseError
+TimeoutError = exceptions.TimeoutError
+CacheError = exceptions.CacheError
+AuthenticationError = exceptions.AuthenticationError
+RateLimitError = exceptions.RateLimitError
 
 
 class TestExceptionHierarchy:

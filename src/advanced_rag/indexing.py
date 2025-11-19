@@ -605,34 +605,40 @@ class MilvusIndexManager:
         # Check cache first
         cache = get_semantic_cache()
         
-        async def compute_embedding():
+        async def compute_embedding_inner() -> np.ndarray:
             if self.embedding_generator:
-                # Offload CPU-intensive work to thread pool
+                # Respect async embedding_generator implementations in tests
+                if asyncio.iscoroutinefunction(self.embedding_generator.encode_semantic):
+                    return await self.embedding_generator.encode_semantic(text)
+                # Offload CPU-intensive sync work to thread pool
                 loop = asyncio.get_event_loop()
                 return await loop.run_in_executor(
                     self.embedding_executor,
                     self.embedding_generator.encode_semantic,
-                    text
+                    text,
                 )
-            
+
             # Placeholder: random embedding for demonstration
             return np.random.randn(self.semantic_dim).astype(np.float32)
-        
+
         # Get from cache or compute
-        embedding = await cache.get_or_compute(text, compute_embedding)
+        embedding = await cache.get_or_compute(text, compute_embedding_inner)
         return embedding
     
     async def _generate_sparse_embedding(self, text: str):
         """
-        Generate sparse embedding (BM25-style) with async execution
-        In production, use BM25 or SPLADE
+        Generate sparse embedding (BM25-style) with async execution.
+        In production, use BM25 or SPLADE.
         """
         if self.embedding_generator:
+            # Support async encode_sparse implementations (used in tests)
+            if asyncio.iscoroutinefunction(self.embedding_generator.encode_sparse):
+                return await self.embedding_generator.encode_sparse(text)
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 self.embedding_executor,
                 self.embedding_generator.encode_sparse,
-                text
+                text,
             )
         
         # Placeholder: construct a valid SPARSE_FLOAT_VECTOR payload
@@ -652,14 +658,17 @@ class MilvusIndexManager:
         domain: Optional[str] = None
     ) -> np.ndarray:
         """
-        Generate domain-specific embedding with async execution
-        In production, use domain-adapted models
+        Generate domain-specific embedding with async execution.
+        In production, use domain-adapted models.
         """
         if self.embedding_generator:
+            # Support async encode_domain implementations (used in tests)
+            if asyncio.iscoroutinefunction(self.embedding_generator.encode_domain):
+                return await self.embedding_generator.encode_domain(text, domain or "")
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 self.embedding_executor,
-                lambda: self.embedding_generator.encode_domain(text, domain)
+                lambda: self.embedding_generator.encode_domain(text, domain),
             )
         
         # Placeholder: random embedding

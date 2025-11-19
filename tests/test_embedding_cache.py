@@ -20,7 +20,7 @@ import os
 import importlib.util
 
 # Load module directly without triggering __init__.py
-module_path = os.path.join(os.path.dirname(__file__), '../advanced_rag/embedding_cache.py')
+module_path = os.path.join(os.path.dirname(__file__), '../src/advanced_rag/embedding_cache.py')
 spec = importlib.util.spec_from_file_location("embedding_cache", module_path)
 embedding_cache = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(embedding_cache)
