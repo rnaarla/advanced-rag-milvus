@@ -310,6 +310,7 @@ class ComplianceManager:
             self._store_audit_log(audit_log)
 
         return {
+            "tenant_id": tenant_id,
             "doc_id": doc_id,
             "forgotten": bool(removed_versions),
             "reason": "removed" if removed_versions else "not_found",
