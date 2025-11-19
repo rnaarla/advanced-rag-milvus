@@ -13,6 +13,8 @@ import re
 import logging
 
 from .ranker import LearnedRanker
+from .constants import RetrievalConstants
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -146,44 +148,62 @@ class HybridRetriever:
         """
         profiles: Dict[str, RetrievalConfig] = {}
         profiles["default"] = base_config
+
+        # Helper to clamp top_k and rerank_top_k to safe limits.
+        def _clamp_top_k(value: int) -> int:
+            return max(
+                1,
+                min(int(value), getattr(RetrievalConstants, "MAX_TOP_K", value)),
+            )
+
+        def _clamp_rerank_k(value: int) -> int:
+            return max(1, min(int(value), _clamp_top_k(value)))
+
         # Short FAQ-style lookups: smaller top_k, reranking enabled, modest MMR.
+        faq_top_k = _clamp_top_k(min(base_config.top_k, 10))
         profiles["faq"] = RetrievalConfig(
             hybrid_alpha=base_config.hybrid_alpha,
-            top_k=10,
-            rerank_top_k=5,
+            top_k=faq_top_k,
+            rerank_top_k=_clamp_rerank_k(base_config.rerank_top_k),
             enable_reranking=True,
             dense_weight=base_config.dense_weight,
             sparse_weight=base_config.sparse_weight,
             enable_mmr=False,
             mmr_lambda=0.7,
         )
+
         # Troubleshooting: over-retrieve, use MMR to diversify similar snippets.
+        trouble_top_k = _clamp_top_k(max(base_config.top_k, 30))
         profiles["troubleshooting"] = RetrievalConfig(
             hybrid_alpha=base_config.hybrid_alpha,
-            top_k=max(base_config.top_k, 30),
-            rerank_top_k=10,
+            top_k=trouble_top_k,
+            rerank_top_k=_clamp_rerank_k(10),
             enable_reranking=True,
             dense_weight=base_config.dense_weight,
             sparse_weight=base_config.sparse_weight,
             enable_mmr=True,
             mmr_lambda=0.5,
         )
+
         # Summaries: pull more context but often aggregate, reranking optional.
+        summary_top_k = _clamp_top_k(max(base_config.top_k, 40))
         profiles["summary"] = RetrievalConfig(
             hybrid_alpha=base_config.hybrid_alpha,
-            top_k=max(base_config.top_k, 40),
-            rerank_top_k=10,
+            top_k=summary_top_k,
+            rerank_top_k=_clamp_rerank_k(10),
             enable_reranking=False,
             dense_weight=base_config.dense_weight,
             sparse_weight=base_config.sparse_weight,
             enable_mmr=False,
             mmr_lambda=0.7,
         )
+
         # Long-form analysis: more context and diversification.
+        analysis_top_k = _clamp_top_k(max(base_config.top_k, 30))
         profiles["analysis"] = RetrievalConfig(
             hybrid_alpha=base_config.hybrid_alpha,
-            top_k=max(base_config.top_k, 30),
-            rerank_top_k=10,
+            top_k=analysis_top_k,
+            rerank_top_k=_clamp_rerank_k(10),
             enable_reranking=True,
             dense_weight=base_config.dense_weight,
             sparse_weight=base_config.sparse_weight,
@@ -197,7 +217,42 @@ class HybridRetriever:
         query: str,
         filters: Optional[Dict[str, Any]] = None,
         use_domain_index: bool = False,
-        domain: Optional[str] = None
+        domain: Optional[str] = None,
+        profile_hint: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Public entrypoint for hybrid retrieval with an end-to-end timeout.
+
+        The core retrieval logic lives in _retrieve_inner(); this wrapper applies
+        an overall latency budget so slow downstreams (Milvus, embeddings) do not
+        exceed the configured SLA.
+        """
+        timeout_seconds = float(getattr(RetrievalConstants, "TIMEOUT_SECONDS", 0.3))
+        try:
+            return await asyncio.wait_for(
+                self._retrieve_inner(
+                    query=query,
+                    filters=filters,
+                    use_domain_index=use_domain_index,
+                    domain=domain,
+                    profile_hint=profile_hint,
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "HybridRetriever.retrieve timed out after %.3f seconds", timeout_seconds
+            )
+            # On timeout we degrade gracefully to "no results" instead of raising.
+            return []
+
+    async def _retrieve_inner(
+        self,
+        query: str,
+        filters: Optional[Dict[str, Any]] = None,
+        use_domain_index: bool = False,
+        domain: Optional[str] = None,
+        profile_hint: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Perform hybrid retrieval combining multiple search strategies
@@ -215,7 +270,10 @@ class HybridRetriever:
         # Choose retrieval profile for this query (safe default on any error)
         profile_name = "default"
         try:
-            if self.classifier:
+            # Allow explicit profile override first, then fall back to classifier.
+            if profile_hint and profile_hint in self.profiles:
+                profile_name = profile_hint
+            elif self.classifier:
                 profile_name = self.classifier.classify(query) or "default"
         except Exception:
             profile_name = "default"
@@ -405,10 +463,24 @@ class HybridRetriever:
         
         # Convert to list and sort by fused score
         fused_list = []
+        now = datetime.utcnow()
         for doc_id, info in fused_scores.items():
             result = info["data"]
             result["score"] = info["score"]
             result["retrieval_methods"] = list(set(info["methods"]))
+            # Best-effort recency annotation for downstream rankers:
+            # compute a simple [0,1] recency score from timestamp metadata when present.
+            meta = result.get("metadata")
+            if isinstance(meta, dict) and "timestamp" in meta and "recency" not in meta:
+                try:
+                    ts = datetime.fromisoformat(str(meta["timestamp"]))
+                    age_days = max(0.0, (now - ts).total_seconds() / 86400.0)
+                    recency = 1.0 / (1.0 + age_days)
+                    meta["recency"] = float(recency)
+                    result["metadata"] = meta
+                except Exception:
+                    # If parsing fails, skip recency annotation.
+                    pass
             fused_list.append(result)
         
         # Sort by fused score

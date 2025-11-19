@@ -47,6 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from .embedding_cache import get_semantic_cache
+from .constants import IndexingConstants
 
 
 class IndexType(Enum):
@@ -120,7 +121,7 @@ class MilvusIndexManager:
         
         # Thread pool for CPU-intensive embedding operations
         self.embedding_executor = ThreadPoolExecutor(
-            max_workers=4,
+            max_workers=IndexingConstants.THREAD_POOL_WORKERS,
             thread_name_prefix="embedding-"
         )
         

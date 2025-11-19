@@ -115,6 +115,8 @@ class ComplianceManager:
         self.audit_logs: List[AuditLog] = []
         self.document_versions: Dict[str, List[DocumentVersion]] = {}
         self.lineage_graph: Dict[str, List[str]] = {}  # event_id -> child event_ids
+        # Compliance flags (tenant_id -> set(doc_id)); None for default tenant
+        self.legal_holds: Dict[Optional[str], set[str]] = {}
         
         # Session tracking
         self.current_session_id = self._generate_session_id()
@@ -253,6 +255,65 @@ class ComplianceManager:
             self._store_audit_log(audit_log)
         
         return doc_version
+
+    async def apply_legal_hold(self, doc_id: str, tenant_id: Optional[str] = None) -> None:
+        """
+        Apply a legal hold to a document.
+
+        In-memory implementation:
+        - Marks the (tenant_id, doc_id) pair as under legal hold.
+        - Future retention or deletion logic can consult this flag to skip
+          automatic deletion.
+        """
+        key = tenant_id
+        holds = self.legal_holds.setdefault(key, set())
+        holds.add(doc_id)
+
+    async def forget_document(self, doc_id: str, tenant_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Right-to-forget hook (in-memory implementation).
+
+        Behaviour:
+        - If the (tenant_id, doc_id) is under legal hold, do nothing and return a flag.
+        - Otherwise, clear in-memory version history and emit an audit log
+          entry describing the redaction event.
+        """
+        holds = self.legal_holds.get(tenant_id) or set()
+        if doc_id in holds:
+            return {
+                "tenant_id": tenant_id,
+                "doc_id": doc_id,
+                "forgotten": False,
+                "reason": "legal_hold",
+            }
+
+        removed_versions = self.document_versions.pop(doc_id, [])
+
+        if self.enable_audit and removed_versions:
+            event_id = self._generate_event_id()
+            audit_log = AuditLog(
+                event_id=event_id,
+                event_type=AuditEventType.VERSION_UPDATE,
+                timestamp=datetime.now().isoformat(),
+                user_id=None,
+                session_id=self.current_session_id,
+                event_data={
+                    "doc_id": doc_id,
+                    "action": "forget",
+                    "removed_versions": [v.version for v in removed_versions],
+                },
+                parent_event_id=None,
+                related_event_ids=[],
+                compliance_flags=["right_to_forget"],
+                retention_policy=f"{self.retention_days}_days",
+            )
+            self._store_audit_log(audit_log)
+
+        return {
+            "doc_id": doc_id,
+            "forgotten": bool(removed_versions),
+            "reason": "removed" if removed_versions else "not_found",
+        }
     
     def get_document_lineage(self, doc_id: str) -> List[DocumentVersion]:
         """Get complete version history for a document"""

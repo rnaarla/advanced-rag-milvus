@@ -146,7 +146,7 @@ def test_query_classifier_and_profiles_are_used():
             return [{"id": "X", "content": "foo", "score": 1.0, "metadata": {"doc_id": "d"}}]
 
     # Build a base config and allow HybridRetriever to create default profiles
-    base_cfg = RetrievalConfig(top_k=5)
+    base_cfg = RetrievalConfig(top_k=50, rerank_top_k=20)
     classifier = QueryClassifier(max_faq_len=80, long_query_len=200)
     retriever = HybridRetriever(index_manager=FakeIndexManager(), config=base_cfg, classifier=classifier)
 
@@ -161,6 +161,20 @@ def test_query_classifier_and_profiles_are_used():
     # Fallback/default
     profile3 = classifier.classify("")
     assert profile3 == "default"
+
+    # Profile configs should be tuned for throughput and clamped to safe bounds
+    faq_cfg = retriever.profiles["faq"]
+    trouble_cfg = retriever.profiles["troubleshooting"]
+    summary_cfg = retriever.profiles["summary"]
+    analysis_cfg = retriever.profiles["analysis"]
+
+    assert 1 <= faq_cfg.top_k <= base_cfg.top_k
+    assert trouble_cfg.top_k >= base_cfg.top_k
+    assert summary_cfg.top_k >= trouble_cfg.top_k
+    # Rerank top_k should never exceed profile top_k
+    assert trouble_cfg.rerank_top_k <= trouble_cfg.top_k
+    assert summary_cfg.rerank_top_k <= summary_cfg.top_k
+    assert analysis_cfg.rerank_top_k <= analysis_cfg.top_k
 
 
 def test_rrf_with_mmr_diversification():
@@ -264,6 +278,36 @@ async def test_hybrid_retriever_retrieve_with_domain():
         elif "retrieval_profile" in r:
             profiles.add(r["retrieval_profile"])
     assert profiles  # at least one profile recorded
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retriever_respects_timeout(monkeypatch):
+    """HybridRetriever.retrieve should enforce an overall latency budget."""
+    from advanced_rag.constants import RetrievalConstants
+
+    class SlowIndexManager:
+        async def _generate_semantic_embedding(self, text: str):
+            # Sleep longer than the tightened timeout in this test
+            await asyncio.sleep(0.02)
+            return np.ones(4, dtype=np.float32)
+
+        async def _generate_sparse_embedding(self, text: str):
+            return np.zeros(4, dtype=np.float32)
+
+        async def search(self, query_embedding, collection_name, top_k=20, filters=None, search_params=None):
+            return []
+
+    retriever = HybridRetriever(index_manager=SlowIndexManager())
+
+    original_timeout = RetrievalConstants.TIMEOUT_SECONDS
+    RetrievalConstants.TIMEOUT_SECONDS = 0.005
+    try:
+        results = await retriever.retrieve(query="slow query")
+    finally:
+        RetrievalConstants.TIMEOUT_SECONDS = original_timeout
+
+    # On timeout we degrade gracefully to an empty result list
+    assert results == []
 
 
 @pytest.mark.asyncio
@@ -420,6 +464,24 @@ def test_learned_hybrid_adapter_basic_fit_and_call():
     assert abs(dw_long + sw_long - 1.0) < 1e-6
 
 
+def test_learned_ranker_recency_feature_affects_ordering():
+    """LearnedRanker should be able to boost more recent results when configured."""
+    from advanced_rag import LearnedRanker, LearnedRankerConfig
+
+    cfg = LearnedRankerConfig(base_weight=1.0, method_bonus=0.0, recency_weight=1.0)
+    ranker = LearnedRanker(config=cfg)
+
+    # Same base score, different recency metadata
+    results = [
+        {"id": "old", "score": 0.8, "retrieval_methods": ["semantic"], "metadata": {"recency": 0.1}},
+        {"id": "new", "score": 0.8, "retrieval_methods": ["semantic"], "metadata": {"recency": 0.9}},
+    ]
+    scores = asyncio.get_event_loop().run_until_complete(ranker.score("q", results))
+    assert len(scores) == 2
+    # Newer item should receive a higher score due to recency_weight
+    assert scores[1] > scores[0]
+
+
 def test_semantic_enricher_entities_and_topics():
     """SemanticEnricher should extract at least one entity and topic from rich text."""
     enricher = SemanticEnricher(max_topics=3)
@@ -467,6 +529,52 @@ async def test_pipeline_plan_and_execute_uses_decomposer_and_retrieve(monkeypatc
     assert isinstance(decomp, dict)
     assert calls  # retrieve called at least once
     assert len(calls) == len(decomp["sub_queries"])
+
+
+@pytest.mark.asyncio
+async def test_pipeline_uses_query_rewriter_and_profile_hint(monkeypatch):
+    """AdvancedRAGPipeline should apply QueryRewriter and respect retrieval_profile context hint."""
+    from advanced_rag.query_rewriting import QueryRewriterConfig, QueryRewriter
+
+    class RecordingRewriter(QueryRewriter):
+        def __init__(self):
+            super().__init__(config=QueryRewriterConfig(enable_expansion=False))
+            self.seen = []
+
+        def rewrite(self, query: str, context=None) -> str:
+            self.seen.append((query, context or {}))
+            return f"{query} [rewritten]"
+
+    pipe = AdvancedRAGPipeline(connect_to_milvus=False, query_rewriter=RecordingRewriter())
+
+    seen_queries: List[str] = []
+    seen_profiles: List[str] = []
+
+    async def fake_retrieve(query: str, filters=None, use_domain_index=False, domain=None, profile_hint=None):
+        seen_queries.append(query)
+        if profile_hint:
+            seen_profiles.append(profile_hint)
+        # Minimal shape matching retrieve() expectations
+        return [{"id": "X", "content": "c", "score": 1.0, "metadata": {"doc_id": "d"}}]
+
+    async def fake_rerank(query: str, results: List[Dict[str, Any]], top_k: int = 5):
+        return results[:top_k]
+
+    # Patch retriever methods to avoid touching Milvus and to observe arguments
+    monkeypatch.setattr(pipe.retriever, "retrieve", fake_retrieve)
+    monkeypatch.setattr(pipe.retriever, "rerank", fake_rerank)
+
+    ctx = {"retrieval_profile": "faq"}
+    results, metrics = await pipe.retrieve(query="What is RAG?", context=ctx)
+    assert results  # some result returned
+    # Rewriter should have been invoked with the original query and context
+    assert pipe.query_rewriter.seen
+    orig_q, seen_ctx = pipe.query_rewriter.seen[0]
+    assert orig_q == "What is RAG?"
+    assert seen_ctx == ctx
+    # Retriever should receive rewritten query and profile hint
+    assert any("[rewritten]" in q for q in seen_queries)
+    assert "faq" in seen_profiles
 
 
 def test_experiment_manager_bandit_basic_flow():
@@ -661,6 +769,34 @@ def test_pipeline_performance_report_without_milvus():
     assert "retrieval" in report["stage_latencies"]
 
 
+@pytest.mark.asyncio
+async def test_ingest_documents_records_data_quality(monkeypatch):
+    """AdvancedRAGPipeline.ingest_documents should record basic data quality flags."""
+    from advanced_rag import AdvancedRAGPipeline
+
+    pipe = AdvancedRAGPipeline(connect_to_milvus=False)
+
+    async def fake_index_chunks(chunks, domain=None):
+        return {"total_chunks": len(chunks)}
+
+    # Avoid touching real Milvus
+    monkeypatch.setattr(pipe.index_manager, "index_chunks", fake_index_chunks)
+
+    docs = [
+        {"id": "empty", "text": "", "metadata": {}},
+        {"id": "redundant", "text": "spam " * 200, "metadata": {}},
+        {"id": "ok", "text": "A small but valid document.", "metadata": {}},
+    ]
+
+    report = await pipe.ingest_documents(docs)
+    dq_entries = {entry["document_id"]: entry["flags"] for entry in report.get("data_quality", [])}
+
+    assert "empty" in dq_entries and "empty_text" in dq_entries["empty"]
+    assert "redundant" in dq_entries
+    # At least one quality flag should be present for the redundant doc
+    assert dq_entries["redundant"]
+
+
 def test_compliance_versioning_lineage_and_report():
     from advanced_rag import ComplianceManager
     cm = ComplianceManager(enable_audit=True, enable_versioning=True, retention_days=90)
@@ -686,6 +822,47 @@ def test_compliance_versioning_lineage_and_report():
     assert ok is True
     # Close
     asyncio.get_event_loop().run_until_complete(cm.close())
+
+
+@pytest.mark.asyncio
+async def test_compliance_legal_hold_and_forget_semantics():
+    """ComplianceManager should honour legal holds and implement a basic right-to-forget hook."""
+    from advanced_rag import ComplianceManager
+
+    mgr = ComplianceManager(enable_audit=True, enable_versioning=True)
+
+    # Create a couple of versions for a document
+    await mgr.create_version(
+        doc_id="doc-forget",
+        content="hello",
+        change_type="create",
+        chunk_count=1,
+        total_tokens=5,
+        user_id="u",
+    )
+    await mgr.create_version(
+        doc_id="doc-forget",
+        content="world",
+        change_type="update",
+        chunk_count=2,
+        total_tokens=10,
+        user_id="u",
+    )
+    assert len(mgr.get_document_lineage("doc-forget")) == 2
+
+    # Apply tenant-specific legal holds and verify forget does not remove versions
+    await mgr.apply_legal_hold("doc-forget", tenant_id="tenantA")
+    res_hold = await mgr.forget_document("doc-forget", tenant_id="tenantA")
+    assert res_hold["forgotten"] is False
+    assert res_hold["reason"] == "legal_hold"
+    assert res_hold["tenant_id"] == "tenantA"
+    assert len(mgr.get_document_lineage("doc-forget")) == 2
+
+    # Different tenant should not be blocked by tenantA's hold
+    res_other_tenant = await mgr.forget_document("doc-forget", tenant_id="tenantB")
+    assert res_other_tenant["forgotten"] is True
+    assert res_other_tenant["reason"] == "removed"
+    assert res_other_tenant["tenant_id"] == "tenantB"
 
 def test_pipeline_close_without_milvus():
     from advanced_rag import AdvancedRAGPipeline

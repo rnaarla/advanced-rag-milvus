@@ -19,6 +19,8 @@ from .evaluation import RAGEvaluator, EvaluationMetrics
 from .compliance import ComplianceManager, AuditLog
 from .semantic_enrichment import SemanticEnricher
 from .decomposition import QueryDecomposer, DecompositionResult
+from .query_rewriting import QueryRewriter
+from .constants import APIConstants
 
 
 class PipelineStage(Enum):
@@ -78,7 +80,8 @@ class AdvancedRAGPipeline:
         milvus_host: str = "localhost",
         milvus_port: int = 19530,
         config: Optional[PipelineConfig] = None,
-        connect_to_milvus: bool = True
+        connect_to_milvus: bool = True,
+        query_rewriter: Optional[QueryRewriter] = None,
     ):
         self.config = config or PipelineConfig()
         
@@ -87,6 +90,7 @@ class AdvancedRAGPipeline:
         self.chunker = AdaptiveChunker()
         self.enricher = SemanticEnricher()
         self.decomposer = QueryDecomposer()
+        self.query_rewriter = query_rewriter or QueryRewriter()
         self.index_manager = MilvusIndexManager(
             host=milvus_host,
             port=milvus_port,
@@ -153,6 +157,10 @@ class AdvancedRAGPipeline:
                 "redundancy": metrics.redundancy_score,
                 "domain_density": metrics.domain_density
             })
+
+            # Data quality assessment per document
+            dq = self._assess_data_quality(doc, metrics)
+            ingestion_report.setdefault("data_quality", []).append(dq)
             
             # Stage 2: Adaptive Chunking
             stage_start = datetime.now()
@@ -224,12 +232,17 @@ class AdvancedRAGPipeline:
             Tuple of (retrieval results, evaluation metrics)
         """
         pipeline_start = datetime.now()
-        
+
+        # Apply query rewriting (no-op by default) before retrieval.
+        rewritten_query = self.query_rewriter.rewrite(query, context or {})
+
         # Stage 1: Hybrid Retrieval
         stage_start = datetime.now()
         raw_results = await self.retriever.retrieve(
-            query=query,
-            filters=filters
+            query=rewritten_query,
+            filters=filters,
+            # Allow callers to steer retrieval profile via context hint.
+            profile_hint=(context or {}).get("retrieval_profile") if context else None,
         )
         retrieval_latency = (datetime.now() - stage_start).total_seconds() * 1000
         self._record_latency(PipelineStage.RETRIEVAL, retrieval_latency)
@@ -238,7 +251,7 @@ class AdvancedRAGPipeline:
         if self.config.enable_reranking:
             stage_start = datetime.now()
             reranked_results = await self.retriever.rerank(
-                query=query,
+                query=rewritten_query,
                 results=raw_results,
                 top_k=self.config.rerank_top_k
             )
@@ -397,7 +410,37 @@ class AdvancedRAGPipeline:
         # Keep rolling window of last 1000 measurements
         if len(self.stage_latencies[stage]) > 1000:
             self.stage_latencies[stage] = self.stage_latencies[stage][-1000:]
-    
+
+    def _assess_data_quality(
+        self,
+        doc: Dict[str, Any],
+        metrics: DiagnosticMetrics,
+    ) -> Dict[str, Any]:
+        """
+        Lightweight data quality checks for ingestion.
+
+        Flags obvious issues only (empty text, extreme redundancy, etc.) and
+        records them in the ingestion report for operators to inspect.
+        """
+        flags = []
+        text = (doc.get("text") or "").strip()
+        if not text:
+            flags.append("empty_text")
+
+        if len(text) > APIConstants.MAX_DOCUMENT_TEXT_LENGTH:
+            flags.append("text_too_long")
+
+        if metrics.redundancy_score > 0.95:
+            flags.append("high_redundancy")
+
+        if metrics.information_entropy < 0.05:
+            flags.append("very_low_entropy")
+
+        return {
+            "document_id": doc.get("id"),
+            "flags": flags,
+        }
+
     async def close(self):
         """Cleanup resources"""
         await self.index_manager.close()

@@ -27,6 +27,7 @@ class LearnedRankerConfig:
     base_weight: float = 1.0
     method_bonus: float = 0.1  # bonus when result comes from multiple methods
     diversity_penalty: float = 0.0  # reserved for future use
+    recency_weight: float = 0.0  # optional boost for more recent content
 
 
 @dataclass
@@ -60,14 +61,20 @@ class LearnedRanker:
         Expected keys in `result`:
         - "score" (float)
         - "retrieval_methods" (optional list[str])
-        - "metadata" (optional dict, not currently used here)
+        - "metadata" (optional dict)
         """
         base_score = float(result.get("score", 0.0))
         methods = result.get("retrieval_methods") or []
         method_count = float(len(methods))
+        meta = result.get("metadata") or {}
+        # Recency is treated as a pre-computed, unitless score in [0,1] where
+        # larger values indicate "more recent". This keeps the implementation
+        # deterministic and avoids dependence on wall-clock time.
+        recency = float(meta.get("recency", 0.0)) if isinstance(meta, dict) else 0.0
         return {
             "base_score": base_score,
             "method_count": method_count,
+            "recency": recency,
         }
 
     def update_from_feedback(
@@ -112,6 +119,7 @@ class LearnedRanker:
             s = (
                 self.config.base_weight * feats["base_score"]
                 + self.config.method_bonus * feats["method_count"]
+                + self.config.recency_weight * feats.get("recency", 0.0)
             )
             scores.append(float(s))
         return scores
